@@ -94,3 +94,18 @@ Against the caller-owned-stream baseline without cancellation, the same executab
 Use the caller-owned-stream framework build and test compiler commands above, replacing the test source and executable name with `input-lease.m` and `input-lease`. Keep the command dictionary next to the executable. The baseline exits 1 with `ABI=0 kept=0 bytes=11`: output completes but cleanup has closed the caller's input. The lease registration must keep that input open until the caller unregisters and closes it. Stop dispatch and wait for completion before unregistering; the input lease does not replace the command tree's cancellation registration. Hosts that call from an existing thread must install the intended session streams and command-thread TLS before each command.
 
 Run the input fixture a second time with argument `cancel`. It keeps the pipe writer open, cancels through the original tree registration and expects only `NEXT\n` after cleanup. The fixture uses a cancellable `read` syscall; blocked stdio reads are not guaranteed to unwind on pthread cancellation. This variant catches a stdin-only registration incorrectly replacing the tree cancellation owner.
+# Native terminal detection
+
+`native-tty.m` uses a real socket pair and the public session/stream APIs. The same executable resolves `ios_useNativeTTY` with `dlsym`, so it also runs against an unmodified framework. It verifies the default virtual terminal, actual socket descriptor state after opting in, and restoration of the default after opting out.
+
+Build and run on an explicitly selected booted Simulator:
+
+```sh
+xcodebuild -project ios_system.xcodeproj -scheme ios_system -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/native-tty -jobs 2 ARCHS=arm64 CODE_SIGNING_ALLOWED=NO IPHONEOS_DEPLOYMENT_TARGET=15.0 build
+mkdir -p .build/native-tty-check/Frameworks
+cp -R .build/native-tty/Build/Products/Release-iphonesimulator/ios_system.framework .build/native-tty-check/Frameworks/
+xcrun --sdk iphonesimulator clang -target arm64-apple-ios15.0-simulator -isysroot "$(xcrun --sdk iphonesimulator --show-sdk-path)" -fobjc-arc -Wall -Wextra -Wno-unused-parameter -I ios_system -F .build/native-tty-check/Frameworks -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks tests/native-tty.m -o .build/native-tty-check/native-tty
+xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-tty-check/native-tty"
+```
+
+The baseline exits 1 with `native=1/1/1 descriptor=1`. The patched framework exits 0 with `default=1 native=0/0/0 descriptor=0 restored=1 PASS`. This socket test does not qualify physical-device behavior or PTY support.
