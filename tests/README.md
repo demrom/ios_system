@@ -109,3 +109,8 @@ xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-tty-check/native-tty"
 ```
 
 The baseline exits 1 with `native=1/1/1 descriptor=1`. The patched framework exits 0 with `default=1 native=0/0/0 descriptor=0 restored=1 PASS`. This socket test does not qualify physical-device behavior or PTY support.
+# Reselecting session streams
+
+`session-streams.m` creates two sessions, installs caller streams in the first, selects the second and reselects the first. It checks the public input descriptor and runs a registered command whose exact `SESSION\n` output must reach the original caller stream. It clears the caller thread's TLS streams before dispatch so the selected session supplies them.
+
+Use the framework build and test compiler command above, replacing the source and executable name with `session-streams.m` and `session-streams`, adding `-fobjc-arc -Wl,-export_dynamic`, and copying `Resources/commandDictionary.plist` next to the executable. Success prints `bytes=8 PASS`; the broken session reselection resets stdin to fd 0 and leaves the capture empty. Session-list initialization must finish before concurrent use, and callers must keep sessions alive while commands or window-size readers use them.
