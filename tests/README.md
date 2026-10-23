@@ -196,3 +196,9 @@ xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/child-status/child-status"
 ```
 
 Expected: exit 0 and `child A expected=7 observed=7; child B expected=23 observed=23: PASS`, `missing command expected=127 observed=127` and `empty command expected=0 observed=0; NULL command expected=0 observed=0`. With shared session status, both children report 23 and the test exits 1. A ten-second alarm bounds a stalled wait. This fixture covers a normal return, `ios_exit` and commands that do not start; it does not qualify cancellation, thread-creation failure or PID reuse.
+
+# Redirect stderr to caller stdout
+
+`dup2-stdout-stderr.m` dispatches a registered consumer through `ios_system`. It calls the public `ios_dup2` and `ios_activateChildStreams` APIs to redirect stderr to the active stdout descriptor, then writes a recovery line after restoring its streams. Three calls must preserve the caller-owned files and produce exactly `redirected\nrecovery\n` three times, with empty error output. No pending stdout redirection is required.
+
+Use the framework build above, replacing the test source and executable name with `dup2-stdout-stderr.m` and `dup2-stdout-stderr`. Retain `-Wl,-export_dynamic` so the command can be registered. Success is exit 0 and `stdout=60 stderr-empty=1 PASS`. The unchanged framework produces `stdout=27 stderr-empty=0 FAIL` and exits 1 because the diagnostic is written to the original error stream. A five-second alarm bounds the test.
