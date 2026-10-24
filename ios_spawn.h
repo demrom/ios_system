@@ -19,7 +19,10 @@ int ios_posix_spawn_file_actions_destroy(ios_posix_spawn_file_actions_t *);
 int ios_posix_spawn_file_actions_adddup2(ios_posix_spawn_file_actions_t *, int, int);
 int ios_posix_spawn_file_actions_addclose(ios_posix_spawn_file_actions_t *, int);
 int ios_posix_spawn_file_actions_addchdir_np(ios_posix_spawn_file_actions_t *, const char *);
+/* A returning native parent cancels and reaps its unreaped worker children. */
 int ios_posix_spawn(pid_t *, const char *, const ios_posix_spawn_file_actions_t *, const void *, char *const [], char *const []);
+int ios_killpid(pid_t, int);
+int ios_interruptpid(pid_t);
 /* Wait for an ios_posix_spawn PID; options is 0 or WNOHANG. Returns PID, 0 while
  * running, or -1 with errno. Status uses waitpid encoding (ios_killpid with SIGINT, SIGTERM, SIGKILL, SIGHUP or SIGQUIT: exit 128 + signal; worker transport failure: exit 125).
  * Optional usage is the isolated worker's RUSAGE_SELF snapshot at command exit,

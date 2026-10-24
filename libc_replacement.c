@@ -268,19 +268,33 @@ void ios_waitForPidRegistration(void) {
     pthread_mutex_unlock(&pid_mtx);
 }
 
+extern void ios_resetPidWorkerState(pid_t pid);
+
+// The caller holds pid_mtx until every result has been copied.
+int ios_consumePidStatusLocked(pid_t pid) {
+    int status = wait_status(pid);
+    native_reservations[pid] = false;
+    ios_resetPidWorkerState(pid);
+    return status;
+}
+
 static int consume_wait_status(pid_t pid) {
     if (pid <= 0 || pid >= IOS_MAX_THREADS) return wait_status(pid);
     pthread_mutex_lock(&pid_mtx);
-    int status = wait_status(pid);
-    native_reservations[pid] = false;
+    int status = ios_consumePidStatusLocked(pid);
     pthread_mutex_unlock(&pid_mtx);
     return status;
 }
+
+extern int ios_interruptpid(pid_t pid);
 
 void ios_reapNativeChildren(pid_t parent) {
     for (pid_t child = 1; child < IOS_MAX_THREADS; child++) {
         pthread_mutex_lock(&pid_mtx);
         bool owned = native_reservations[child] && previousPid[child] == parent;
+        // Worker proxies are not in the native command tree. Cancel them before
+        // cleanup waits, while the reservation still identifies this parent's child.
+        if (owned) ios_interruptpid(child);
         pthread_mutex_unlock(&pid_mtx);
         if (owned) ios_waitpid(child);
     }
@@ -312,7 +326,6 @@ void newPreviousDirectory(void) {
 
 // We do not recycle process ids too quickly to avoid collisions.
 void storeEnvironment(char* envp[]);
-extern void ios_resetPidWorkerState(pid_t pid);
 static void storeEnvironmentForPid(char *const envp[], pid_t pid);
 static inline pid_t ios_nextAvailablePid(bool native) {
     while (cleanup_counter > 0) { } // Don't start a command while another is ending.
@@ -760,7 +773,7 @@ pid_t vfork(void) { return ios_nextAvailablePid(false); }
 
 // simple replacement of waitpid for swift programs
 // We use "optnone" to prevent optimization, otherwise the while loops never end.
-__attribute__ ((optnone)) static void wait_for_pid(pid_t pid) {
+__attribute__ ((optnone)) void ios_waitForPidCompletion(pid_t pid) {
     
     executeWebAssemblyCommandsInOrder();
     
@@ -792,7 +805,7 @@ __attribute__ ((optnone)) static void wait_for_pid(pid_t pid) {
 }
 
 void ios_waitpid(pid_t pid) {
-    wait_for_pid(pid);
+    ios_waitForPidCompletion(pid);
     consume_wait_status(pid);
 }
 
@@ -819,7 +832,7 @@ __attribute__ ((optnone)) pid_t waitpid(pid_t pid, int *stat_loc, int options) {
         }
     } else {
         // Wait until the process is terminated:
-        wait_for_pid(pid);
+        ios_waitForPidCompletion(pid);
         int status = consume_wait_status(pid);
         if (stat_loc) *stat_loc = W_EXITCODE(status, 0);
         return pid;
@@ -853,7 +866,7 @@ __attribute__ ((optnone)) pid_t ios_full_waitpid(pid_t pid, int *stat_loc, int o
         }
     } else {
         // Wait until the process is terminated:
-        wait_for_pid(pid);
+        ios_waitForPidCompletion(pid);
         int status = consume_wait_status(pid);
         if (stat_loc) *stat_loc = W_EXITCODE(status, 0);
         return pid;

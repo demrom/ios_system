@@ -466,6 +466,7 @@ static pthread_mutex_t pidUsageMutex = PTHREAD_MUTEX_INITIALIZER;
 static struct rusage pidUsage[IOS_PID_STATUS_SLOTS];
 static bool pidUsageAvailable[IOS_PID_STATUS_SLOTS];
 static bool pidWasSpawned[IOS_PID_STATUS_SLOTS];
+static uint64_t pidUsageGeneration[IOS_PID_STATUS_SLOTS];
 
 // pid of the command running on this thread, so exit() can record its status too.
 static __thread pid_t commandPid = -1;
@@ -477,6 +478,7 @@ void ios_resetPidWorkerState(pid_t pid) {
     atomic_store(&pidWorkerSignal[pid], 0);
     pthread_mutex_lock(&pidUsageMutex);
     pidWasSpawned[pid] = false;
+    ++pidUsageGeneration[pid];
     pidUsageAvailable[pid] = false;
     pthread_mutex_unlock(&pidUsageMutex);
 }
@@ -485,25 +487,58 @@ static void recordPidStatus(int status) {
     ios_storePidStatus(commandPid, status);
 }
 
+typedef struct {
+    pid_t pid;
+    uint64_t generation;
+} workerWait;
+
+static void abandonWorkerWait(void *context) {
+    workerWait *wait = context;
+    pthread_mutex_lock(&pidUsageMutex);
+    if (pidUsageGeneration[wait->pid] == wait->generation)
+        pidWasSpawned[wait->pid] = true;
+    pthread_mutex_unlock(&pidUsageMutex);
+}
+
 pid_t ios_wait4(pid_t pid, int *status, int options, struct rusage *usage, int *available) {
     if (available) *available = 0;
     if (usage) memset(usage, 0, sizeof(*usage));
     if ((options != 0 && options != WNOHANG) || (usage && !available)) { errno = EINVAL; return -1; }
-    if (pid < 0 || pid >= IOS_PID_STATUS_SLOTS) { errno = ECHILD; return -1; }
+    if (pid <= 0 || pid >= IOS_PID_STATUS_SLOTS) { errno = ECHILD; return -1; }
     pthread_mutex_lock(&pidUsageMutex);
-    bool spawned = pidWasSpawned[pid];
+    if (!pidWasSpawned[pid]) {
+        pthread_mutex_unlock(&pidUsageMutex);
+        errno = ECHILD;
+        return -1;
+    }
+    if (options == WNOHANG && ios_getThreadId(pid) != 0) {
+        pthread_mutex_unlock(&pidUsageMutex);
+        return 0;
+    }
+    workerWait wait = {pid, pidUsageGeneration[pid]};
+    pidWasSpawned[pid] = false; // Exactly one waiter owns this generation.
     pthread_mutex_unlock(&pidUsageMutex);
-    if (!spawned) { errno = ECHILD; return -1; }
-    if (options == WNOHANG && ios_getThreadId(pid) != 0) return 0;
-    ios_waitpid(pid);
-    int result = ios_pidStatus(pid);
-    if (result < 0) { errno = ECHILD; return -1; }
-    if (status) *status = W_EXITCODE(result, 0);
+    pid_t result = -1;
+    pthread_cleanup_push(abandonWorkerWait, &wait);
+    extern void ios_waitForPidCompletion(pid_t);
+    extern int ios_consumePidStatusLocked(pid_t);
+    extern pthread_mutex_t pid_mtx;
+    ios_waitForPidCompletion(pid);
+    // Match allocation's lock order and retain the PID until status and usage are copied.
+    pthread_mutex_lock(&pid_mtx);
     pthread_mutex_lock(&pidUsageMutex);
-    if (usage && pidUsageAvailable[pid]) *usage = pidUsage[pid];
-    if (available) *available = pidUsageAvailable[pid];
+    if (pidUsageGeneration[pid] == wait.generation) {
+        if (status) *status = W_EXITCODE(ios_pidStatus(pid), 0);
+        if (usage && pidUsageAvailable[pid]) *usage = pidUsage[pid];
+        if (available) *available = pidUsageAvailable[pid];
+        result = pid;
+    }
     pthread_mutex_unlock(&pidUsageMutex);
-    return pid;
+    if (result == pid) ios_consumePidStatusLocked(pid);
+    pthread_mutex_unlock(&pid_mtx);
+    pthread_cleanup_pop(0);
+    if (result < 0) errno = ECHILD;
+    return result;
 }
 
 struct _commandHelper {
@@ -1675,18 +1710,27 @@ int ios_posix_spawn(pid_t *pid, const char *path,
     child->worker.fd = -1;
     int cancellationState;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellationState);
+    pid_t callerPid = ios_nativePid();
+    ios_bindNativePid(currentCommand ? currentCommand->ownerPid : ios_dispatchedPid());
+    child->command.pid = ios_forkNative();
+    ios_bindNativePid(callerPid);
+    if (child->command.pid < 0) {
+        for (int i = 0; i < 3; i++) fclose(*streams[i]);
+        free(child);
+        pthread_setcancelstate(cancellationState, NULL);
+        return EAGAIN;
+    }
     int error = directory ? spawn(line.UTF8String, directory, 80, 24,
         (const char *const *)envp, &options, &child->worker.fd, &child->worker.job) : errno;
     if (error != 0) {
+        ios_storeThreadIdForPid(child->command.pid, NULL);
+        ios_waitpid(child->command.pid);
         for (int i = 0; i < 3; i++) fclose(*streams[i]);
         free(child);
         pthread_setcancelstate(cancellationState, NULL);
         return error;
     }
     child->worker.errFd = options.stderr_fd;
-    pid_t callerPid = ios_nativePid();
-    child->command.pid = ios_forkNative();
-    ios_bindNativePid(callerPid);
     if (child->command.pid > 0) {
         pthread_mutex_lock(&pidUsageMutex);
         pidWasSpawned[child->command.pid] = true;
@@ -1698,7 +1742,7 @@ int ios_posix_spawn(pid_t *pid, const char *path,
     dispatch_semaphore_t ready = dispatch_semaphore_create(0);
     child->worker.ready = (__bridge_retained void *)ready;
     pthread_t thread;
-    error = childPid < 0 ? EAGAIN : pthread_create(&thread, NULL, spawnedWorkerMain, child);
+    error = pthread_create(&thread, NULL, spawnedWorkerMain, child);
     if (error) {
         CFBridgingRelease(child->worker.ready);
         if (childPid > 0) {
@@ -3334,9 +3378,10 @@ extern pthread_t ios_getThreadId(pid_t pid);
 int ios_killpid(pid_t pid, int sig) {
     pthread_t thread = ios_getThreadId(pid);
     if (thread != NULL && thread != (pthread_t)-1) {
-        if (pid >= 0 && pid < IOS_PID_STATUS_SLOTS && atomic_load(&pidWorkerThread[pid]) == thread
-            && (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGHUP || sig == SIGQUIT))
-        {
+        if (pid >= 0 && pid < IOS_PID_STATUS_SLOTS && atomic_load(&pidWorkerThread[pid]) == thread) {
+            if (sig == 0) return 0;
+            if (sig != SIGINT && sig != SIGTERM && sig != SIGKILL && sig != SIGHUP && sig != SIGQUIT)
+                return EINVAL;
             atomic_store(&pidWorkerSignal[pid], sig);
             return pthread_cancel(thread); // ends the proxy, which cancels the worker
         }
@@ -3350,14 +3395,15 @@ int ios_interruptpid(pid_t pid) {
     pthread_t thread = ios_getThreadId(pid);
     if (thread == NULL || thread == (pthread_t)-1) return ESRCH;
     pthread_mutex_lock(&commandSignalMutex);
+    if (pid >= 0 && pid < IOS_PID_STATUS_SLOTS && atomic_load(&pidWorkerThread[pid]) == thread) {
+        atomic_store(&pidWorkerSignal[pid], SIGINT);
+        int error = pthread_cancel(thread);
+        pthread_mutex_unlock(&commandSignalMutex);
+        return error;
+    }
     for (functionParameters *p = runningSignalCommands; p; p = p->nextSignalCommand) {
         if (p->pid != pid || !pthread_equal(p->signalThread, thread)) continue;
-        if (pid >= 0 && pid < IOS_PID_STATUS_SLOTS && atomic_load(&pidWorkerThread[pid]) == thread) {
-            // Proxy cleanup records the worker command's actual status.
-            atomic_store(&pidWorkerSignal[pid], SIGINT);
-        } else {
-            p->cancellationSignal = SIGINT;
-        }
+        p->cancellationSignal = SIGINT;
         int error = pthread_cancel(thread);
         if (error) p->cancellationSignal = 0;
         pthread_mutex_unlock(&commandSignalMutex);
