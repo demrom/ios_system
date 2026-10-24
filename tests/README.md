@@ -1,3 +1,19 @@
+# Descriptor limits
+
+`descriptor-limits.m` exercises real command dispatch, pipelines and the native spawn API with a changed process descriptor limit. Build it with the native spawn fixture flags below and keep the command dictionary beside the executable. Run each mode in a separate Simulator process:
+
+```sh
+xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-spawn/descriptor-limits" startup
+xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-spawn/descriptor-limits" startup-maximum
+xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-spawn/descriptor-limits" maximum
+xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-spawn/descriptor-limits" pipeline
+xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-spawn/descriptor-limits" spawn
+```
+
+`startup` checks that initialization raises a lower default soft limit to min(hard limit, OPEN_MAX). `startup-maximum` checks that initialization preserves a caller's higher limit. On an iOS 27.0 Simulator, the default soft limit is 256, the hard limit is RLIM_INFINITY and OPEN_MAX is 10240. Before the startup adjustment, `startup` exits 1 with the limit still 256.
+
+`maximum` raises the soft limit to the hard limit, as make does, and checks command completion without changing that limit. `pipeline` lowers the limit to 64 and fills the descriptor table: a pipeline must return nonzero with the real EMFILE diagnostic. `spawn` checks EMFILE from a real byte channel and native child launch, including failure after one or two successful stream duplications. These three modes restore the limit and check the next command's exact output. All modes exit zero on success; a stalled dispatch exits 124 after ten seconds. The baseline times out in `maximum` and fails `pipeline` with status zero and an empty diagnostic; `spawn` already passes.
+
 # Session window size
 
 `window-size.m` calls the public session APIs against the real ios_system framework. It checks independent sessions, reading from a thread without session TLS, resize, closed and unknown sessions, invalid arguments and unchanged outputs on errors.
@@ -8,11 +24,11 @@ Build the framework and test executable, then run on an explicitly selected boot
 xcodebuild -project ios_system.xcodeproj -target ios_system -configuration Release -sdk iphonesimulator -jobs 2 ARCHS=arm64 CODE_SIGNING_ALLOWED=NO SYMROOT="$PWD/.build/window-size" OBJROOT="$PWD/.build/window-size-obj" build
 mkdir -p .build/window-size-check/Frameworks
 cp -R .build/window-size/Release-iphonesimulator/ios_system.framework .build/window-size-check/Frameworks/
-xcrun --sdk iphonesimulator clang -target arm64-apple-ios14.0-simulator -isysroot "$(xcrun --sdk iphonesimulator --show-sdk-path)" -Wall -Wextra -Werror -I ios_system -F .build/window-size/Release-iphonesimulator -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks tests/window-size.m -o .build/window-size-check/window-size
+xcrun --sdk iphonesimulator clang -target arm64-apple-ios15.0-simulator -isysroot "$(xcrun --sdk iphonesimulator --show-sdk-path)" -Wall -Wextra -Werror -I ios_system -F .build/window-size/Release-iphonesimulator -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks tests/window-size.m -o .build/window-size-check/window-size
 xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/window-size-check/window-size"
 ```
 
-Xcode 27 rejects deployment targets below iOS 15 in its build planner. For that SDK, pass `IPHONEOS_DEPLOYMENT_TARGET=15.0` to the local framework build and use `arm64-apple-ios15.0-simulator` for the test executable. This does not change the framework project's deployment settings. A run on a newer Simulator does not qualify runtime behavior on older iOS versions.
+Xcode 27 rejects deployment targets below iOS 15 in its build planner. The framework project requires iOS 15.0, the lowest deployment target supported by Xcode 27's SDK. Use `arm64-apple-ios15.0-simulator` for the test executable. A run on a newer Simulator does not qualify runtime behavior on older iOS versions.
 
 The caller must keep the queried session alive and coordinate session creation/closure with other users of the session APIs.
 
@@ -64,7 +80,7 @@ Expected: exit 0 and `relative write: shell=1 command=0 PASS`. Without the resto
 Use the framework build and test compiler command above, replacing the source and executable name with `session-streams.m` and `session-streams`, adding `-fobjc-arc -Wl,-export_dynamic`, and copying `Resources/commandDictionary.plist` next to the executable. Success prints `bytes=8 PASS`; the broken session reselection resets stdin to fd 0 and leaves the capture empty. Session-list initialization must finish before concurrent use, and callers must keep sessions alive while commands or window-size readers use them.
 # Native terminal detection
 
-`native-tty.m` uses a real socket pair and the public session/stream APIs. The same executable resolves `ios_useNativeTTY` with `dlsym`, so it also runs against an unmodified framework. It verifies the default virtual terminal, actual socket descriptor state after opting in, and restoration of the default after opting out.
+`native-tty.m` uses a real socket pair and the public session/stream APIs. The same executable resolves `ios_useNativeTTY` with `dlsym`, so it also runs against an unmodified framework. It verifies the default virtual terminal, actual socket descriptor state after opting in, and restoration of the default after opting out. It also duplicates socket and pipe terminal streams, redirects the original descriptor to `/dev/null`, and requires the saved duplicate to remain a logical terminal while the original descriptor does not. An unrelated pipe and a regular-file redirect must not match the terminal.
 
 Build and run on an explicitly selected booted Simulator:
 
@@ -161,6 +177,25 @@ xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/waitpid-check/waitpid-idle"
 
 Expected: exit 0 and `ios_waitpid: wall=1.5s cpu=0.0s PASS`. With the polling wait: exit 1 and `FAIL`. The twenty-second alarm bounds a stalled wait.
 
+# Per-child exit status
+
+`child-wait-status.m` starts two registered commands through `ios_fork` and `ios_system`. The first returns 7. The second waits for the first through `ios_waitpid`, then calls `ios_exit(23)`. The parent waits for the second and then the first through `ios_full_waitpid`; each wait must report that child's exit status. It also checks a missing command returns 127 and empty and NULL commands return 0.
+
+From the repository root, build and run on an explicitly selected booted Simulator:
+
+```sh
+xcodebuild -project ios_system.xcodeproj -target ios_system -configuration Release -sdk iphonesimulator -jobs 2 ARCHS=arm64 CODE_SIGNING_ALLOWED=NO IPHONEOS_DEPLOYMENT_TARGET=15.0 CONFIGURATION_BUILD_DIR="$PWD/.build/child-status-sdk" OBJROOT="$PWD/.build/child-status-obj" build
+mkdir -p .build/child-status/Frameworks
+cp -R .build/child-status-sdk/ios_system.framework .build/child-status/Frameworks/
+cp Resources/commandDictionary.plist .build/child-status/
+xcrun --sdk iphonesimulator clang -target arm64-apple-ios15.0-simulator -isysroot "$(xcrun --sdk iphonesimulator --show-sdk-path)" -fobjc-arc -Wall -Wextra -Wno-unused-parameter -I ios_system -F .build/child-status/Frameworks -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks -Wl,-export_dynamic tests/child-wait-status.m -o .build/child-status/child-status
+codesign --force --sign - .build/child-status/Frameworks/ios_system.framework
+codesign --force --sign - .build/child-status/child-status
+xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/child-status/child-status"
+```
+
+Expected: exit 0 and `child A expected=7 observed=7; child B expected=23 observed=23: PASS`, `missing command expected=127 observed=127` and `empty command expected=0 observed=0; NULL command expected=0 observed=0`. With shared session status, both children report 23 and the test exits 1. A ten-second alarm bounds a stalled wait. This fixture covers a normal return, `ios_exit` and commands that do not start; it does not qualify cancellation, thread-creation failure or PID reuse.
+
 # Command thread creation failure
 
 `thread-create-failure.m` dispatches a registered native command through `ios_system`. The external `thread-create-failure-hook.c` interposer makes exactly one OS `pthread_create` call return `EAGAIN`; the framework itself is not instrumented. With allocator scribbling enabled, cleanup must return status 126, preserve all three caller-owned streams and the caller's `SIGUSR1` handler, then run the next command with exact `NEXT\n` output. A ten-second alarm bounds a stalled wait.
@@ -178,21 +213,34 @@ SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$PWD/.build/thread-create-check/thread-creat
 
 Expected: exit 0 and `thread creation failure: status=126; streams, signal and next output: PASS`. Set both `MallocScribble` and `MallocPreScribble`.
 
-# Per-child exit status
+# Cancelling a waiting caller
 
-`child-wait-status.m` starts two registered commands through `ios_fork` and `ios_system`. The first returns 7. The second waits for the first through `ios_waitpid`, then calls `ios_exit(23)`. The parent waits for the second and then the first through `ios_full_waitpid`; each wait must report that child's exit status. It also checks a missing command returns 127 and empty and NULL commands return 0.
+`waitpid-cancel.m` starts a 1.5 s command behind `ios_fork`, calls `ios_waitpid` from a second thread, cancels that thread 0.6 s later while it waits, and joins it. The thread must be cancelled within half a second, long before the command ends, and a later `ios_waitpid` from the main thread must still return. Build it like `waitpid-idle.m`. Expected: exit 0 and `waitpid-cancel: cancelled=1 joined after 0.00s PASS`. Without the cleanup handler in `ios_waitpid`: exit 124 and `FAIL, no end after 20 s`, because the cancelled caller exits with `thread_completion_mutex` locked. A wait that defers the cancel until the command ends: exit 1 and `FAIL`.
 
-From the repository root, build and run on an explicitly selected booted Simulator:
+# Native child execution
+
+The `spawn-*` fixtures exercise the public native child API through registered commands and real command frameworks. They check exact argv bytes in joined and detached sessions, independent environments, stream ownership, nested directory restoration, retained child statuses, cancellation of a child blocked in `fread`, and cancellation of legacy descendants. The image fixture checks separate mutable globals, pool exhaustion and unloading across three sequential invocations. No ios_system implementation is substituted.
+
+After building `ios_system.framework` as above, prepare and run the fixtures on an explicitly selected booted Simulator:
 
 ```sh
-xcodebuild -project ios_system.xcodeproj -target ios_system -configuration Release -sdk iphonesimulator -jobs 2 ARCHS=arm64 CODE_SIGNING_ALLOWED=NO IPHONEOS_DEPLOYMENT_TARGET=15.0 CONFIGURATION_BUILD_DIR="$PWD/.build/child-status-sdk" OBJROOT="$PWD/.build/child-status-obj" build
-mkdir -p .build/child-status/Frameworks
-cp -R .build/child-status-sdk/ios_system.framework .build/child-status/Frameworks/
-cp Resources/commandDictionary.plist .build/child-status/
-xcrun --sdk iphonesimulator clang -target arm64-apple-ios15.0-simulator -isysroot "$(xcrun --sdk iphonesimulator --show-sdk-path)" -fobjc-arc -Wall -Wextra -Wno-unused-parameter -I ios_system -F .build/child-status/Frameworks -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks -Wl,-export_dynamic tests/child-wait-status.m -o .build/child-status/child-status
-codesign --force --sign - .build/child-status/Frameworks/ios_system.framework
-codesign --force --sign - .build/child-status/child-status
-xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/child-status/child-status"
+mkdir -p .build/native-spawn/Frameworks
+cp -R .build/window-size/Release-iphonesimulator/ios_system.framework .build/native-spawn/Frameworks/
+cp Resources/commandDictionary.plist .build/native-spawn/
+for name in arguments environment streams directory inherited-directory inherited-directory-stability session-directory session-reaping unload-streams status-retention cancellation legacy-cancellation parent-exit legacy-pid session-thread fork-cancellation helper-context helper-cleanup images; do
+    xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator -fobjc-arc -Wall -Wextra -Wno-unused-parameter -I . -I ios_system -F .build/native-spawn/Frameworks -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks -Wl,-export_dynamic "tests/spawn-$name.m" -o ".build/native-spawn/spawn-$name"
+done
+for name in ImageA ImageB; do
+    mkdir -p ".build/native-spawn/Frameworks/$name.framework"
+    xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator -Wall -Wextra -Wno-unused-parameter -dynamiclib -I . -I ios_system -F .build/native-spawn/Frameworks -framework ios_system tests/spawn-image-command.c -install_name "@rpath/$name.framework/$name" -o ".build/native-spawn/Frameworks/$name.framework/$name"
+done
+plutil -insert image-job -json '["@rpath/ImageA.framework/ImageA","image_main","","no",["@rpath/ImageB.framework/ImageB"]]' .build/native-spawn/commandDictionary.plist
+mkdir -p .build/native-spawn/Frameworks/Unload.framework
+xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator -Wall -Wextra -Wno-unused-parameter -dynamiclib -I . -I ios_system -F .build/native-spawn/Frameworks -framework ios_system tests/spawn-unload-command.c -install_name @rpath/Unload.framework/Unload -o .build/native-spawn/Frameworks/Unload.framework/Unload
+plutil -insert unload-job -json '["@rpath/Unload.framework/Unload","unload_main","","no",[]]' .build/native-spawn/commandDictionary.plist
+for name in arguments environment streams directory inherited-directory inherited-directory-stability session-directory session-reaping unload-streams status-retention cancellation legacy-cancellation parent-exit legacy-pid session-thread fork-cancellation helper-context helper-cleanup images; do
+    xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-spawn/spawn-$name" || exit "$?"
+done
 ```
 
 Expected: exit 0 and `child A expected=7 observed=7; child B expected=23 observed=23: PASS`, `missing command expected=127 observed=127` and `empty command expected=0 observed=0; NULL command expected=0 observed=0`. With shared session status, both children report 23 and the test exits 1. A ten-second alarm bounds a stalled wait. This fixture covers a normal return, `ios_exit` and commands that do not start; it does not qualify cancellation, thread-creation failure or PID reuse.
@@ -272,3 +320,60 @@ xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/direct-cancellation/check" "$P
 ```
 
 The process has an eight-second bound. Success exits 0 and prints `direct interrupt result=0 status=130 following=7 PASS`. Delivering an ignored process signal alone would let the first command complete normally with status 7. The separate handler case requires `handler delivery result=0 handled=1 status=23 PASS`.
+`spawn-unload-streams.m` requires a real command framework to emit its atexit marker through child stderr during image unload, before EOF and PID completion.
+
+`spawn-session-reaping.m` checks that a returning legacy root in session A does not wait for or consume a live native child in session B. It observes completion through public PID waits while B remains held on a pipe.
+
+The directory fixtures also check that session B can switch directory and finish a command while a native child in session A is running, sharing the process directory and an unchanged inherited directory does not undo a parent's later change. The helper fixtures check that threads created through ios_command_thread_create inherit the command context, can launch children, and finish cancellation cleanup before a returning parent releases its streams. Each executable has an alarm and exits zero on success. These fixtures qualify the native command boundary on Simulator; they do not qualify physical-device behavior or threads created directly through pthread_create.
+
+# Launch serialization during stream cleanup
+
+`spawn-cleanup-serialization.m` first launches a child with borrowed streams, then launches one with owned descriptors. The external `spawn-cleanup-close-hook.c` interposes the OS `fclose` boundary to pause that second child's stream cleanup. A concurrent launch through `ios_spawn` must wait until cleanup is released. The fixture observes the launch through a pipe; it does not read runtime counters. Build it like the other native-spawn fixtures and build the hook as a Simulator dylib with `-dynamiclib -Wl,-undefined,dynamic_lookup`. Run with `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` pointing to that dylib. Expected: exit 0 and `launch waits for stream cleanup after borrowed child: early=0 PASS`. The old runtime reports `early=1 FAIL` and exits 1. A ten-second alarm bounds a stalled run.
+
+# Auxiliary command thread lifetime
+
+`legacy-thread-lifetime.m` launches 32 legacy child commands from each of a joined and a detached root command. Every PID wait must preserve the child's exit status of 7. Run it under ThreadSanitizer to check that completed auxiliary command threads are reclaimed: the old runtime reports leaked threads after the command checks pass.
+
+Build the framework with `-fsanitize=thread` in both `OTHER_CFLAGS` and `OTHER_LDFLAGS`, then compile the fixture against that framework:
+
+```sh
+xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator -fsanitize=thread -fobjc-arc -Wall -Wextra -Werror -Wno-unused-parameter -I ios_system -F .build/native-spawn/Frameworks -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks -Wl,-export_dynamic tests/legacy-thread-lifetime.m -o .build/native-spawn/legacy-thread-lifetime
+cp "$(xcrun --sdk iphonesimulator clang -print-resource-dir)/lib/darwin/libclang_rt.tsan_iossim_dynamic.dylib" .build/native-spawn/Frameworks/
+SIMCTL_CHILD_TSAN_OPTIONS=halt_on_error=1 xcrun simctl spawn "$SIMULATOR_UDID" "$PWD/.build/native-spawn/legacy-thread-lifetime"
+```
+
+Expected: two `LEGACY_THREAD_LIFETIME` pass lines and process exit 0, with no sanitizer findings.
+
+# Parent completion regressions
+
+Build these fixtures like the native-spawn fixtures above, retaining the command dictionary beside each executable. `spawn-unforked-session.m` checks that an unforked command in one session finishes while another session owns a blocked child. `joined-pipeline.m` checks that a synchronous pipeline waits for its final stage and returns that stage's status. `spawn-background-parent.m` checks child launch after a legacy parent has returned; run with `SIMCTL_CHILD_MallocScribble=1` to expose stale parent pointers. `spawn-restore-status.m` checks that a child directory-restore error returns 126 without changing the caller session status. Each executable exits zero on success.
+
+`spawn-buffered-return.m` checks a normally returning parent with a live child and an owned output channel. Run it separately with `normal`, `full` and `contended`. Expected: the normal case preserves `BUFFERED\n` and status 17; a full socket finishes with status 126; a contended stdio lock finishes with status 17. Each process exits zero when the expected result is observed, with a ten-second alarm bounding a hang. Normal return attempts a nonblocking flush under `ftrylockfile` before forced child shutdown; explicit cancellation retains its existing cleanup path.
+
+`spawn-helper-cooperative.m` launches a real detached command helper with POSIX cancellation disabled. The helper polls `ios_command_cancelled()` outside locks. Normal parent return must finish with status 17 and one completed helper; explicit cancellation must finish with status 130 and a second completed helper. The ten-second watchdog bounds a failure to stop. Build and run it like the other native-spawn fixtures.
+
+`spawn-log-cancellation.m` cancels a real command while Foundation logging is paused at its OS `writev` boundary by `log-writev-hook.c`. Compile the hook as a Simulator dylib with `-dynamiclib -Wl,-undefined,dynamic_lookup` and run with `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES=PROBE/log-writev-hook.dylib`. Expected: process zero and `LOG_CANCEL status=33280 PASS`. Runtime logging defers cancellation until Foundation releases its internal lock, so cleanup can log safely.
+
+The a-shell integration fixture `native-git/tests/unforked-environment.m` (in the accompanying native Git change) runs a real Git shell alias executing `env` in an unforked session while another forked session holds private `FOO=b`. The first session must observe host `FOO=a` and no `FOO=b`. `ios_command_environment()` returns the running command's owned environment; an unforked root uses the host environment. The returned pointers are borrowed and must be copied before mutating that environment.
+
+`spawn-interpreter-path.m` launches the real bundled Wasm3 interpreter through the public command registry, first directly and then through a script whose Wasm shebang interpreter exists only on the child's private PATH. Compile `tests/path-interpreter.wat` to Wasm with a standard WAT assembler, then pass that file to the fixture. Both cases must print `PRIVATE_WASM` and report `status=0 bytes=13 PASS`; the direct control must pass before interpreting a shebang failure. The fixture uses `addCommandList` to select stock Wasm3, so it does not require an application's WebKit interpreter. Interpreter discovery must use the same command environment as normal PATH lookup.
+
+`spawn-legacy-environment-return.m` runs a forked legacy root that sets a private variable, launches a native child and returns. A following forked root must not inherit that variable, and the current PID must return to its pre-fork value. Expected: exit zero and `LEGACY_ENV_RETURN before=0 after=0 leaked=0 PASS`. Native child launch restores the caller's incoming PID binding on completion and on allocation failure.
+
+# Child launch during parent cleanup
+
+`spawn-stopping-parent.m` starts an owned helper that waits for `ios_command_cancelled()` after its parent returns normally, then calls `ios_spawn`. The launch must return `ECANCELED`, and waiting for the parent must still report exit status 17. Compile it with the native spawn fixture flags and run on an explicitly selected Simulator. The ten-second alarm bounds a stalled cleanup. Before the fix it reports `launch_error=0 FAIL`; after the fix it reports `launch_error=89 PASS` on Darwin and exits 0.
+
+Run it again with `system` to cover legacy `ios_system` dispatch from the same stopping helper. The registered leaf blocks if entered. Parent cleanup must finish with status 17 and zero leaf calls; before the legacy admission fix this mode reaches the watchdog (124).
+
+# Directory diagnostics under backpressure
+
+`spawn-cd-backpressure.m` fills a real error pipe, then dispatches `cd` to a missing directory in one public session. A caller-provided `FILE` write callback signals that the diagnostic has reached its write, then forwards it to the full pipe. A second session must still launch and wait for a native command with exit status 23 before draining the diagnostic. Compile with the native spawn fixture flags, keep the command dictionary beside the executable and run on an explicitly selected Simulator. The baseline reaches the ten-second watchdog (124); the fix prints `CD_BACKPRESSURE launch_error=0 status=5888 PASS` and exits 0.
+
+# Nested legacy commands sharing a native PID
+
+`spawn-nested-system.m` calls `ios_system` from a native command without an intervening `ios_fork`. Its nested command must finish flushing `LEAF` while the caller's separate native child remains blocked, and that child's later wait must still return status 23. Run the fixture again with `cancel`: normal parent return cancels the nested command, but the parent's status must remain 17. Compile with the native spawn fixture flags and run on an explicitly selected Simulator. Before the fix, the first mode reports `completed=0 FAIL` and the cancellation mode reports parent status 130; both fixed modes exit 0 and report parent status 17. The fixture retains the inherited command PID and environment, exercising only completion and status ownership.
+
+# Borrowed input during command completion
+
+`borrowed-input.m` runs a registered command through joined `ios_system` with caller-provided streams. Once the command has entered, another host thread blocks in `fgetc` on its input. The command must return before the host supplies input. Compile with the native spawn fixture flags, retain `commandDictionary.plist` beside the executable, and run both without arguments (public owned-stream registration) and with `unregistered` (session-owned input). Each case must print `COMMAND_COMPLETED_BEFORE_INPUT=1`, `BORROWED_INPUT status=0 PASS` and exit zero. The ten-second completion deadline detects the regression; the fixture then supplies one byte and joins both threads so a failure does not leave a blocked process. Before the fix, cleanup blocks first in the diagnostic `fileno` call, which takes the same `FILE` lock as `fgetc`; guarding only input `fflush` is insufficient.

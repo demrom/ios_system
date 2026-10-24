@@ -109,6 +109,18 @@ Example:
 
 `ios_execve` also exists, and stores the environment.
 
+### Native child commands
+
+Include `ios_spawn.h` to launch a child from a running native command without reparsing its arguments as shell text. `ios_spawn` accepts the command path, a NULL-terminated argument vector and an optional environment vector; the path must equal `argv[0]`. It returns zero after launch or an error number. Reap the returned synthetic PID once with `ios_full_waitpid`; its status belongs to that child and remains available until reaped. A direct native child result does not replace the calling session's `ios_getCommandStatus()`, including `ios_exit` and missing-command results. Legacy commands invoked through `ios_system` retain their shared session status behavior. Native launches return `EAGAIN` when all PID slots are reserved.
+
+An `ios_spawn_options` value supplies stdin, stdout and stderr descriptors, an optional directory, and a cancellation mask. The framework duplicates the supplied descriptors and closes its own copies when the child finishes. The caller retains its descriptors. NULL options borrow the calling command's streams and inherit its directory; NULL `envp` inherits the calling command's environment. Commands continue to use `thread_stdin`, `thread_stdout`, `thread_stderr` and the environment functions from `ios_error.h`.
+
+The current directory is per-process, like other ios_system commands. A child with an explicit directory, or one that changes directory, restores its previous directory before completion is reported. Concurrent commands and session changes share the process directory and proceed while children run. Commands that need stable filesystem references use absolute paths or wait for their children before accessing relative paths.
+
+Use `ios_spawn_pipe` for child channels that must unblock on cancellation. It returns a socket pair with the read endpoint first and the write endpoint second; the caller owns both. Set `IOS_SPAWN_CANCEL_INPUT`, `IOS_SPAWN_CANCEL_OUTPUT` or `IOS_SPAWN_CANCEL_ERROR` only for endpoints belonging to that child. `ios_spawn_cancel` shuts down those endpoints and cancels the child command tree, including commands dispatched through `ios_system`. Reap afterward; cancellation reports status 130. Cancellation of arbitrary library threads or unrelated file descriptors is outside this interface.
+
+A command dictionary entry may append a fifth element containing an array of additional framework paths. The normal framework path and these copies form a bounded image pool. Each active invocation leases one image until its command has finished and the image has been unloaded, so simultaneous commands can use independent C globals. Copies must export the same entry point and use distinct framework identities. `ios_spawn` returns `EAGAIN` on pool exhaustion; `ios_system` reports status 126. Entries without this array retain their existing loading behavior. Do not preload pooled command images, because an external loader reference prevents their globals from resetting on unload.
+
 ## Adding more commands:
 
 `ios_system` is OpenSource; you can extend it in any way you want. Keep in mind the intrinsic limitations: 
@@ -154,3 +166,5 @@ To add a command:
 - pdftex, luatex and all TeX-based programs: <a href="https://www.gnu.org/licenses/gpl.html">GNU General Public License</a>.
 
 Using BSD versions has consequences on the flags and how they work. For example, there are two versions of `sed`, the BSD version and the GNU version. They have roughly the same behaviour, but differ on `-i` (in place): the GNU version overwrites the file if you don't provide an extension, the BSD version won't work unless you provide the extension to use on the backup file (and will backup the input file with that extension). 
+
+Library workers that share locks can disable POSIX cancellation and call `ios_command_cancelled()` at points where they hold no locks. It returns true for explicit cancellation and when their owning command is finishing. The command must wake any workers waiting for work and join them before releasing their arguments or library locks. Workers blocked on external I/O still need cancellable channels or an explicit wakeup.

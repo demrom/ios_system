@@ -3,6 +3,7 @@
 #include <sys/types.h>
 #include <stddef.h>
 #include <sys/resource.h>
+#include <pthread.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +26,54 @@ int ios_posix_spawn(pid_t *, const char *, const ios_posix_spawn_file_actions_t 
  * including process startup. availability is required when usage is requested;
  * zero means unavailable (including cancellation), never a measured zero. */
 pid_t ios_wait4(pid_t, int *, int, struct rusage *, int *availability);
+
+enum {
+    IOS_SPAWN_CANCEL_INPUT = 1,
+    IOS_SPAWN_CANCEL_OUTPUT = 2,
+    IOS_SPAWN_CANCEL_ERROR = 4
+};
+
+typedef struct {
+    int input;
+    int output;
+    int error;
+    const char *directory;
+    // Channels belonging to this child, eligible for shutdown on cancellation.
+    unsigned cancelStreams;
+} ios_spawn_options;
+
+// Launch from a running native command; path must equal argv[0].
+// NULL options borrow its streams and inherit cwd; NULL envp inherits environment.
+// Explicit stream descriptors are duplicated; the caller retains its originals.
+// Arguments are copied without shell parsing. The current directory is per-process,
+// like other ios_system commands. A supplied directory is restored at child cleanup;
+// concurrent commands and session changes share it. Use absolute paths when needed.
+// Return 0 after launch or an error number; reap once with ios_full_waitpid.
+int ios_spawn(pid_t *pid, const char *path, const ios_spawn_options *options,
+              char *const argv[], char *const envp[]);
+
+// Create a cancellable byte channel: descriptors[0] reads, descriptors[1] writes.
+// The caller owns both descriptors. Cancel shuts down the child stream endpoints.
+// Return 0, or -1 with errno set, like pipe(2).
+int ios_spawn_pipe(int descriptors[2]);
+
+// Cancel command channels and the command tree; wait still reaps the command.
+int ios_spawn_cancel(pid_t pid);
+
+// Return whether the running command was cancelled or is finishing. Helpers may
+// disable pthread cancellation and poll this at points where they hold no locks.
+int ios_command_cancelled(void);
+
+// Borrow the running command's environment until its next environment mutation.
+// Unforked roots use the host environment rather than another session's PID.
+char **ios_command_environment(void);
+
+// Create a library helper thread with the current command's PID, environment,
+// session and borrowed streams. The command retains its context until helpers
+// exit and cancels them during command cleanup. Normal pthread join/attr rules apply.
+int ios_command_thread_create(pthread_t *thread, const pthread_attr_t *attributes,
+                              void *(*function)(void *), void *argument);
+
 #ifdef __cplusplus
 }
 #endif

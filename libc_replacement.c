@@ -51,7 +51,7 @@ void finishedPreparingWebAssemblyCommand(void) {
 }
 
 static void executeWebAssemblyCommandsInOrder(void) {
-    static void (*function)(void) = NULL;
+    void (*function)(void) = NULL;
     if (function == NULL) {
         function = dlsym(RTLD_MAIN_ONLY, "executeWebAssemblyCommands");
     }
@@ -118,9 +118,14 @@ int scanf (const char *format, ...) {
     return (count);
 }
 int ios_fflush(FILE *stream) {
-    if (stream == NULL) return 0;
     if (thread_stdout == NULL) thread_stdout = stdout;
     if (thread_stderr == NULL) thread_stderr = stderr;
+    if (stream == NULL) {
+        // Do not flush streams owned by concurrently running commands.
+        int output = fflush(thread_stdout);
+        int error = thread_stderr == thread_stdout ? 0 : fflush(thread_stderr);
+        return output || error ? EOF : 0;
+    }
 
     if (fileno(stream) == STDOUT_FILENO) return fflush(thread_stdout);
     if (fileno(stream) == STDERR_FILENO) return fflush(thread_stderr);
@@ -186,10 +191,15 @@ int ios_putw(int w, FILE *stream) {
 #define IOS_MAX_THREADS 128
 static _Atomic(pthread_t) thread_ids[IOS_MAX_THREADS];
 static _Atomic int command_status[IOS_MAX_THREADS];
+static bool native_reservations[IOS_MAX_THREADS];
 static pthread_mutex_t thread_completion_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t thread_completed = PTHREAD_COND_INITIALIZER;
 
-static void notify_thread_completion(void) {
+static void unlockThreadCompletion(void *mutex) {
+    pthread_mutex_unlock(mutex);
+}
+
+void ios_notifyThreadCompletion(void) {
     pthread_mutex_lock(&thread_completion_mutex);
     pthread_cond_broadcast(&thread_completed);
     pthread_mutex_unlock(&thread_completion_mutex);
@@ -227,19 +237,65 @@ static int previousPid[IOS_MAX_THREADS];
 
 static int pid_overflow = 0;
 static pid_t current_pid = 0;
+static __thread pid_t dispatched_pid;
+static __thread pid_t native_pid = -1;
+static __thread pid_t native_dispatch_parent = -1;
+static __thread int legacy_dispatch_cancellation = -1;
+
+pid_t ios_nativePid(void) { return native_pid; }
+pid_t ios_dispatchedPid(void) { return dispatched_pid; }
+void ios_bindNativePid(pid_t pid) { native_pid = pid; native_dispatch_parent = -1; }
+pid_t ios_takeNativeDispatchParent(void) {
+    pid_t parent = native_dispatch_parent;
+    native_dispatch_parent = -1;
+    return parent;
+}
+int ios_takeLegacyDispatchCancellation(void) {
+    int state = legacy_dispatch_cancellation;
+    legacy_dispatch_cancellation = -1;
+    return state;
+}
 // We need to lock current_pid during operations
 pthread_mutex_t pid_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pid_registered = PTHREAD_COND_INITIALIZER;
+static pid_t legacy_registration_pid;
 _Atomic(int) cleanup_counter = 0;
 static pid_t last_allocated_pid = 0;
 
+void ios_waitForPidRegistration(void) {
+    pthread_mutex_lock(&pid_mtx);
+    while (legacy_registration_pid) pthread_cond_wait(&pid_registered, &pid_mtx);
+    pthread_mutex_unlock(&pid_mtx);
+}
+
+static int consume_wait_status(pid_t pid) {
+    if (pid <= 0 || pid >= IOS_MAX_THREADS) return wait_status(pid);
+    pthread_mutex_lock(&pid_mtx);
+    int status = wait_status(pid);
+    native_reservations[pid] = false;
+    pthread_mutex_unlock(&pid_mtx);
+    return status;
+}
+
+void ios_reapNativeChildren(pid_t parent) {
+    for (pid_t child = 1; child < IOS_MAX_THREADS; child++) {
+        pthread_mutex_lock(&pid_mtx);
+        bool owned = native_reservations[child] && previousPid[child] == parent;
+        pthread_mutex_unlock(&pid_mtx);
+        if (owned) ios_waitpid(child);
+    }
+}
+
 
 void makeGlobal(void) {
-    copyEnvironment[current_pid] = environment[current_pid];
-    environment[current_pid] = NULL; // makes it really global
+    pid_t pid = ios_currentPid();
+    copyEnvironment[pid] = environment[pid];
+    environment[pid] = NULL; // makes it really global
 }
 void makeLocal(void) {
-    environment[current_pid] = copyEnvironment[current_pid];
-    copyEnvironment[current_pid] = NULL;
+    pid_t pid = ios_currentPid();
+    environment[pid] = copyEnvironment[pid];
+    copyEnvironment[pid] = NULL;
 }
 
 inline pthread_t ios_getThreadId(pid_t pid) {
@@ -249,56 +305,94 @@ inline pthread_t ios_getThreadId(pid_t pid) {
 }
 
 void newPreviousDirectory(void) {
+    pid_t pid = ios_currentPid();
     // Called when a command calls "cd". Actually changes the directory for that command.
-    getwd(previousDirectory[current_pid]);
+    getwd(previousDirectory[pid]);
 }
 
 // We do not recycle process ids too quickly to avoid collisions.
 void storeEnvironment(char* envp[]);
 extern void ios_resetPidWorkerState(pid_t pid);
-static inline const pid_t ios_nextAvailablePid(void) {
+static void storeEnvironmentForPid(char *const envp[], pid_t pid);
+static inline pid_t ios_nextAvailablePid(bool native) {
     while (cleanup_counter > 0) { } // Don't start a command while another is ending.
+    int cancellation = -1;
+    if (!native) {
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
+        legacy_dispatch_cancellation = cancellation;
+    }
     // fprintf(stderr, "Locking in ios_nextAvailablePid\n");
     pthread_mutex_lock(&pid_mtx);
-    char** currentEnvironment = environmentVariables(current_pid);
-    int previousPidId = current_pid;
+    while (legacy_registration_pid) pthread_cond_wait(&pid_registered, &pid_mtx);
+    char** currentEnvironment = environmentVariables(ios_currentPid());
+    int previousPidId = ios_currentPid();
+    pid_t allocatedPid;
     if (!pid_overflow && (last_allocated_pid < IOS_MAX_THREADS - 1)
-        && (thread_ids[last_allocated_pid+1] == 0)) {
-        current_pid = last_allocated_pid + 1;
-        last_allocated_pid = current_pid;
-        command_status[current_pid] = 130; // Cancellation before a recorded exit.
-        ios_resetPidWorkerState(current_pid);
-        thread_ids[current_pid] = -1; // Not yet started
-        numVariablesSet[current_pid] = 0;
-        environment[current_pid] = NULL;
-        storeEnvironment(currentEnvironment); // duplicate the environment variables
-        getwd(previousDirectory[current_pid]); // store current working directory
-        previousPid[current_pid] = previousPidId;
+        && (thread_ids[last_allocated_pid+1] == 0)
+        && !native_reservations[last_allocated_pid+1]) {
+        allocatedPid = last_allocated_pid + 1;
+        last_allocated_pid = allocatedPid;
+        native_reservations[allocatedPid] = native;
+        command_status[allocatedPid] = 130; // Cancellation before a recorded exit.
+        ios_resetPidWorkerState(allocatedPid);
+        thread_ids[allocatedPid] = -1; // Not yet started
+        numVariablesSet[allocatedPid] = 0;
+        environment[allocatedPid] = NULL;
+        storeEnvironmentForPid(currentEnvironment, allocatedPid); // duplicate the environment variables
+        getwd(previousDirectory[allocatedPid]); // store current working directory
+        previousPid[allocatedPid] = previousPidId;
+        if (!native && native_pid < 0) {
+            current_pid = allocatedPid;
+            legacy_registration_pid = allocatedPid;
+        }
         // fprintf(stderr, "Returning from ios_nextAvailablePid, pid= %d\n", current_pid);
-        return current_pid;
+        if (native_pid >= 0) {
+            native_dispatch_parent = native_pid;
+            native_pid = allocatedPid;
+        }
+        pthread_mutex_unlock(&pid_mtx);
+        return allocatedPid;
     }
     // We've already started more than IOS_MAX_THREADS threads.
-    if (!pid_overflow) current_pid = 0; // first time over the limit
     pid_overflow = 1;
+    int candidates = 0;
     while (1) {
-        current_pid = last_allocated_pid + 1;
-        last_allocated_pid = current_pid;
-        if (current_pid >= IOS_MAX_THREADS) {
-            current_pid = 1;
+        if (candidates++ >= IOS_MAX_THREADS - 1) {
+            pthread_mutex_unlock(&pid_mtx);
+            if (!native) {
+                legacy_dispatch_cancellation = -1;
+                pthread_setcancelstate(cancellation, NULL);
+            }
+            return -1;
+        }
+        allocatedPid = last_allocated_pid + 1;
+        last_allocated_pid = allocatedPid;
+        if (allocatedPid >= IOS_MAX_THREADS) {
+            allocatedPid = 1;
             last_allocated_pid = 1;
         }
-        pthread_t thread_pid = ios_getThreadId(current_pid);
-        if (thread_pid == 0) { // We found a not-active pid
-            command_status[current_pid] = 130; // Cancellation before a recorded exit.
-            ios_resetPidWorkerState(current_pid);
-            thread_ids[current_pid] = -1; // Not yet started
-            numVariablesSet[current_pid] = 0;
-            environment[current_pid] = NULL;
-            storeEnvironment(currentEnvironment); // duplicate the environment variables
-            getwd(previousDirectory[current_pid]); // store current working directory
-            previousPid[current_pid] = previousPidId;
+        pthread_t thread_pid = ios_getThreadId(allocatedPid);
+        if (thread_pid == 0 && !native_reservations[allocatedPid]) { // We found a not-active pid
+            native_reservations[allocatedPid] = native;
+            command_status[allocatedPid] = 130; // Cancellation before a recorded exit.
+            ios_resetPidWorkerState(allocatedPid);
+            thread_ids[allocatedPid] = -1; // Not yet started
+            numVariablesSet[allocatedPid] = 0;
+            environment[allocatedPid] = NULL;
+            storeEnvironmentForPid(currentEnvironment, allocatedPid); // duplicate the environment variables
+            getwd(previousDirectory[allocatedPid]); // store current working directory
+            previousPid[allocatedPid] = previousPidId;
+            if (!native && native_pid < 0) {
+                current_pid = allocatedPid;
+                legacy_registration_pid = allocatedPid;
+            }
             // fprintf(stderr, "Returning from ios_nextAvailablePid, pid= %d\n", current_pid);
-            return current_pid;
+            if (native_pid >= 0) {
+                native_dispatch_parent = native_pid;
+                native_pid = allocatedPid;
+            }
+            pthread_mutex_unlock(&pid_mtx);
+            return allocatedPid;
         }
         // Dangerous: if the process is already killed, this wil crash
         /*
@@ -311,29 +405,36 @@ static inline const pid_t ios_nextAvailablePid(void) {
 }
 
 void ios_storeThreadIdForPid(pid_t pid, pthread_t thread) {
+    pthread_mutex_lock(&pid_mtx);
     // To avoid issues when a command starts a command without forking,
     // we only store thread IDs for the first thread of the "process".
-    // fprintf(stderr, "Unlocking pid %d, storing thread %x current value: %x\n", pid, thread,  thread_ids[pid]);
+    // fprintf(stderr, "Unlocking pid %d, storing thread %x current value: %x\n", current_pid, thread,  thread_ids[pid]);
     if (thread_ids[pid] == -1) {
+        if (thread) dispatched_pid = pid;
         thread_ids[pid] = thread;
-        if (!thread) notify_thread_completion();
+        if (!thread) ios_notifyThreadCompletion();
+    }
+    if (legacy_registration_pid == pid) {
+        legacy_registration_pid = 0;
+        pthread_cond_broadcast(&pid_registered);
     }
     pthread_mutex_unlock(&pid_mtx);
 }
 
 inline void ios_storeThreadId(pthread_t thread) {
-    ios_storeThreadIdForPid(current_pid, thread);
+    ios_storeThreadIdForPid(ios_currentPid(), thread);
 }
 
 
 char* libc_getenv(const char* variableName) {
-    if (environment[current_pid] != NULL) {
+    pid_t pid = ios_currentPid();
+    if (environment[pid] != NULL) {
         if (variableName == NULL) { return NULL; }
         // fprintf(stderr, "libc_getenv: %s\n", variableName); fflush(stderr);
-        char** envp = environment[current_pid];
+        char** envp = environment[pid];
         unsigned long varNameLen = strlen(variableName);
         if (varNameLen == 0) { return NULL; }
-        for (int i = 0; i < numVariablesSet[current_pid]; i++) {
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
             if (envp[i] == NULL) { continue; }
             if (strlen(envp[i]) < varNameLen) { continue; }
             if (strncmp(variableName, envp[i], varNameLen) == 0) {
@@ -403,15 +504,18 @@ int ios_setenv_pid(const char* variableName, const char* value, int overwrite, i
 }
 
 int ios_setenv_parent(const char* variableName, const char* value, int overwrite) {
-    return ios_setenv_pid(variableName, value, overwrite, previousPid[current_pid]);
+    pid_t pid = ios_currentPid();
+    return ios_setenv_pid(variableName, value, overwrite, previousPid[pid]);
 }
 
 int ios_setenv(const char* variableName, const char* value, int overwrite) {
-    return ios_setenv_pid(variableName, value, overwrite, current_pid);
+    pid_t pid = ios_currentPid();
+    return ios_setenv_pid(variableName, value, overwrite, pid);
 }
 
 int ios_putenv(char* string) {
-    if (environment[current_pid] != NULL) {
+    pid_t pid = ios_currentPid();
+    if (environment[pid] != NULL) {
         unsigned length;
         char     *temp;
 
@@ -424,9 +528,9 @@ int ios_putenv(char* string) {
         length = (unsigned) (temp - string + 1);
 
         /*  Scan through the environment looking for "NAME="  */
-        char** envp = environment[current_pid];
+        char** envp = environment[pid];
 
-        for (int i = 0; i < numVariablesSet[current_pid]; i++) {
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
             if (envp[i] == NULL) { continue; }
             if ( strncmp( string, envp[i], length ) == 0 ) {
                 // Found it. Copy in place.
@@ -436,12 +540,12 @@ int ios_putenv(char* string) {
             }
         }
         // Not found so far, add it to the list:
-        int pos = numVariablesSet[current_pid];
-        environment[current_pid] = realloc(envp, (numVariablesSet[current_pid] + 2) * sizeof(char*));
-        environment[current_pid][pos] = malloc(strlen(string) + 1);
-        environment[current_pid][pos + 1] = NULL;
-        memcpy(environment[current_pid][pos], string, strlen(string) + 1);
-        numVariablesSet[current_pid] += 1;
+        int pos = numVariablesSet[pid];
+        environment[pid] = realloc(envp, (numVariablesSet[pid] + 2) * sizeof(char*));
+        environment[pid][pos] = malloc(strlen(string) + 1);
+        environment[pid][pos + 1] = NULL;
+        memcpy(environment[pid][pos], string, strlen(string) + 1);
+        numVariablesSet[pid] += 1;
         return 0;
     } else {
         return putenv(string);
@@ -502,11 +606,13 @@ int ios_unsetenv_pid(const char* variableName, int pid) {
 }
 
 int ios_unsetenv_parent(const char* variableName) {
-    return ios_unsetenv_pid(variableName, previousPid[current_pid]);
+    pid_t pid = ios_currentPid();
+    return ios_unsetenv_pid(variableName, previousPid[pid]);
 }
 
 int ios_unsetenv(const char* variableName) {
-    return ios_unsetenv_pid(variableName, current_pid);
+    pid_t pid = ios_currentPid();
+    return ios_unsetenv_pid(variableName, pid);
 }
 
 
@@ -514,25 +620,29 @@ int ios_unsetenv(const char* variableName) {
 // Copy the entire environment:
 extern char** environ;
 void resetEnvironment(pid_t pid);
-void storeEnvironment(char* envp[]) {
-    if (environment[current_pid] != NULL) {
+static void storeEnvironmentForPid(char *const envp[], pid_t pid) {
+    if (environment[pid] != NULL) {
         // We already allocated one environment. Let's clean it:
-        resetEnvironment(current_pid);
+        resetEnvironment(pid);
     }
     int i = 0;
     while (envp[i] != NULL) {
         i++;
     }
-    numVariablesSet[current_pid] = i;
-    environment[current_pid] = malloc((numVariablesSet[current_pid] + 1) * sizeof(char*));
-    for (int i = 0; i < numVariablesSet[current_pid]; i++) {
+    numVariablesSet[pid] = i;
+    environment[pid] = malloc((numVariablesSet[pid] + 1) * sizeof(char*));
+    for (int i = 0; i < numVariablesSet[pid]; i++) {
         if (envp[i] != NULL)
-            environment[current_pid][i] = strdup(envp[i]);
+            environment[pid][i] = strdup(envp[i]);
         else
-            environment[current_pid][i] = NULL;
+            environment[pid][i] = NULL;
     }
     // Keep NULL-termination:
-    environment[current_pid][numVariablesSet[current_pid]] = NULL;
+    environment[pid][numVariablesSet[pid]] = NULL;
+}
+
+void storeEnvironment(char* envp[]) {
+    storeEnvironmentForPid(envp, ios_currentPid());
 }
 
 // when the command is terminated, release the environment variables that were added.
@@ -586,9 +696,9 @@ void ios_releaseThread(pthread_t thread) {
             // fprintf(stderr, "Reset current directory to %s because process %d terminates\n", previousDirectory[p], p);
             // Restore cwd before publishing completion to ios_waitpid callers.
             chdir_nolock(previousDirectory[p]);
-            current_pid = previousPid[p];
+            if (native_pid < 0) current_pid = previousPid[p];
             thread_ids[p] = NULL;
-            notify_thread_completion();
+            ios_notifyThreadCompletion();
             return;
         }
     }
@@ -600,9 +710,9 @@ void ios_releaseBackgroundThread(pthread_t thread) {
     for (int p = 0; p < IOS_MAX_THREADS; p++) {
         if (thread_ids[p] == thread) {
             // fprintf(stderr, "Found Id %d\n", p);
-            current_pid = previousPid[p];
+            if (native_pid < 0) current_pid = previousPid[p];
             thread_ids[p] = NULL;
-            notify_thread_completion();
+            ios_notifyThreadCompletion();
             return;
         }
     }
@@ -610,11 +720,13 @@ void ios_releaseBackgroundThread(pthread_t thread) {
 }
 
 void ios_releaseBackgroundThreadId(pid_t pid) {
+    pthread_mutex_lock(&pid_mtx);
     if (thread_ids[pid] != 0) {
-        current_pid = previousPid[pid];
+        if (!native_reservations[pid] && current_pid == pid) current_pid = previousPid[pid];
         thread_ids[pid] = 0;
-        notify_thread_completion();
+        ios_notifyThreadCompletion();
     }
+    pthread_mutex_unlock(&pid_mtx);
 }
 
 void ios_releaseThreadId(pid_t pid) {
@@ -624,9 +736,9 @@ void ios_releaseThreadId(pid_t pid) {
         // fprintf(stderr, "Locking for pid %d in ios_releaseThreadId\n", pid);
         // fprintf(stderr, "Reset current directory to %s because process %d terminates\n", previousDirectory[pid], pid);
         chdir_nolock(previousDirectory[pid]);
-        current_pid = previousPid[pid];
+        if (native_pid < 0) current_pid = previousPid[pid];
         thread_ids[pid] = 0;
-        notify_thread_completion();
+        ios_notifyThreadCompletion();
         // fprintf(stderr, "Unlocking for pid %d in ios_releaseThreadId\n", pid);
     } else {
         // fprintf(stderr, "ios_releaseThreadId: pid %d was already terminated.\n", pid);
@@ -634,30 +746,31 @@ void ios_releaseThreadId(pid_t pid) {
 }
 
 pid_t ios_currentPid(void) {
-    return current_pid;
+    return native_pid >= 0 ? native_pid : current_pid;
 }
 
 // Note to self: do not redefine getpid() unless you have a way to make it consistent even when a "process" starts a new thread.
 // 0MQ and asyncio rely on this.
-pid_t fork(void) { return ios_nextAvailablePid(); } // increases current_pid by 1.
-pid_t ios_fork(void) { return ios_nextAvailablePid(); } // increases current_pid by 1.
-pid_t vfork(void) { return ios_nextAvailablePid(); }
+pid_t fork(void) { return ios_nextAvailablePid(false); } // increases current_pid by 1.
+pid_t ios_forkNative(void) { return ios_nextAvailablePid(true); }
+pid_t ios_fork(void) { return ios_nextAvailablePid(false); } // increases current_pid by 1.
+pid_t vfork(void) { return ios_nextAvailablePid(false); }
 
 
 
 // simple replacement of waitpid for swift programs
 // We use "optnone" to prevent optimization, otherwise the while loops never end.
-__attribute__ ((optnone)) void ios_waitpid(pid_t pid) {
+__attribute__ ((optnone)) static void wait_for_pid(pid_t pid) {
     
     executeWebAssemblyCommandsInOrder();
     
-    pthread_t threadToWaitFor;
     // Old system: no explicit pid, just store last thread Id.
     if ((pid == -1) || (pid == 0)) {
-        threadToWaitFor = ios_getLastThreadId();
-        while (threadToWaitFor != 0) {
-            threadToWaitFor = ios_getLastThreadId();
-        }
+        pthread_mutex_lock(&thread_completion_mutex);
+        pthread_cleanup_push(unlockThreadCompletion, &thread_completion_mutex);
+        while (ios_getLastThreadId() != 0)
+            pthread_cond_wait(&thread_completed, &thread_completion_mutex);
+        pthread_cleanup_pop(1);
         return;
     }
     // New system: thread Id is store with pid:
@@ -665,12 +778,22 @@ __attribute__ ((optnone)) void ios_waitpid(pid_t pid) {
     // ios_system detaches command threads, so pthread_join cannot wait for them.
     // Include the allocated-but-not-started (-1) state and recheck under the
     // notification mutex to avoid losing an exit between the check and wait.
+    // pthread_cond_wait is a cancellation point and reacquires the mutex before
+    // the cancellation cleanup handlers run: the handler releases it, so a
+    // cancelled caller does not leave every ending command blocked in
+    // notify_thread_completion.
     pthread_mutex_lock(&thread_completion_mutex);
+    pthread_cleanup_push(unlockThreadCompletion, &thread_completion_mutex);
     while (atomic_load(&thread_ids[pid]) != 0)
         pthread_cond_wait(&thread_completed, &thread_completion_mutex);
-    pthread_mutex_unlock(&thread_completion_mutex);
+    pthread_cleanup_pop(1);
     // fprintf(stderr, "Returning from ios_waitpid for %d \n", pid);
     return;
+}
+
+void ios_waitpid(pid_t pid) {
+    wait_for_pid(pid);
+    consume_wait_status(pid);
 }
 
 __attribute__ ((optnone)) pid_t waitpid(pid_t pid, int *stat_loc, int options) {
@@ -688,15 +811,17 @@ __attribute__ ((optnone)) pid_t waitpid(pid_t pid, int *stat_loc, int options) {
         if (threadToWaitFor != 0) // the process is still running
             return 0;
         else {
-            if (stat_loc) *stat_loc = W_EXITCODE(wait_status(pid), 0);
+            int status = consume_wait_status(pid);
+        if (stat_loc) *stat_loc = W_EXITCODE(status, 0);
             fflush(thread_stdout);
             fflush(thread_stderr);
             return pid; // was "-1". See man page and https://github.com/holzschu/ios_system/issues/89
         }
     } else {
         // Wait until the process is terminated:
-        ios_waitpid(pid);
-        if (stat_loc) *stat_loc = W_EXITCODE(wait_status(pid), 0);
+        wait_for_pid(pid);
+        int status = consume_wait_status(pid);
+        if (stat_loc) *stat_loc = W_EXITCODE(status, 0);
         return pid;
     }
 }
@@ -720,15 +845,17 @@ __attribute__ ((optnone)) pid_t ios_full_waitpid(pid_t pid, int *stat_loc, int o
         if (threadToWaitFor != 0) // the process is still running
             return 0;
         else {
-            if (stat_loc) *stat_loc = W_EXITCODE(wait_status(pid), 0);
+            int status = consume_wait_status(pid);
+        if (stat_loc) *stat_loc = W_EXITCODE(status, 0);
             fflush(thread_stdout);
             fflush(thread_stderr);
             return pid; // was "-1". See man page and https://github.com/holzschu/ios_system/issues/89
         }
     } else {
         // Wait until the process is terminated:
-        ios_waitpid(pid);
-        if (stat_loc) *stat_loc = W_EXITCODE(wait_status(pid), 0);
+        wait_for_pid(pid);
+        int status = consume_wait_status(pid);
+        if (stat_loc) *stat_loc = W_EXITCODE(status, 0);
         return pid;
     }
 }
