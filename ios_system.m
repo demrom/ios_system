@@ -96,6 +96,7 @@ typedef struct _sessionParameters {
     pthread_t current_command_root_thread; // thread ID of first command
     _Atomic(pthread_t) lastThreadId; // thread ID of last command.
     _Atomic(pthread_t) mainThreadId; // thread ID of parent command, if any (e.g. vim, which starts "sh -c cd dir && flake8 file")
+    _Atomic int foregroundPid; // Dash publishes its actual job, never the shell waiter.
     FILE* stdin;
     FILE* stdout;
     FILE* stderr;
@@ -118,6 +119,7 @@ static void initSessionParameters(sessionParameters* sp) {
     sp->current_command_root_thread = 0;
     sp->lastThreadId = 0;
     sp->mainThreadId = 0;
+    sp->foregroundPid = 0;
     NSString* currentDirectory = [NSFileManager.defaultManager currentDirectoryPath];
     strcpy(sp->currentDir, [currentDirectory UTF8String]);
     strcpy(sp->previousDirectory, [currentDirectory UTF8String]);
@@ -446,6 +448,7 @@ typedef struct _functionParameters {
     void *inputOwner;
     struct _functionParameters *ownedNext;
     pthread_t ownedThread;
+    char ownedCommandName[NAME_MAX];
     bool ownedRunning, commandStarted;
     pid_t pid;
     bool workerEligible, asyncSpawn;
@@ -884,6 +887,27 @@ typedef struct ownedStreams {
 static pthread_mutex_t ownedStreamsMutex = PTHREAD_MUTEX_INITIALIZER;
 static ownedStreams *registeredStreams;
 static __thread ownedStreams *currentOwnedStreams;
+
+__attribute__((visibility("default"))) int ashell_owned_command_name(FILE *output, char *name, size_t capacity) {
+    if (!output || !name || !capacity) return EINVAL;
+    int error = EAGAIN;
+    pthread_mutex_lock(&ownedStreamsMutex);
+    for (ownedStreams *entry = registeredStreams; entry; entry = entry->next) {
+        if (entry->streams[1] != output) continue;
+        for (functionParameters *p = entry->commands; p; p = p->ownedNext) {
+            if (!p->ownedRunning || p->backgroundCommand) continue;
+            int length = snprintf(name, capacity, "%s", p->ownedCommandName);
+            error = length < 0 || (size_t)length >= capacity ? ENOSPC : 0;
+            break;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&ownedStreamsMutex);
+    return error;
+}
+
+_Atomic int ashell_exec_in_flight = 0;
+_Atomic(FILE *) ashell_host_streams[3];
 
 int ashell_register_owned_streams(FILE *input, FILE *output, FILE *error, void **registration) {
     if (!input || !output || !error || !registration || *registration) return EINVAL;
@@ -1853,6 +1877,7 @@ static void* run_function(void* parameters) {
         bool cancelled = currentOwnedStreams && currentOwnedStreams->cancelled;
         p->ownedThread = pthread_self();
         p->ownedRunning = !cancelled;
+        snprintf(p->ownedCommandName, sizeof(p->ownedCommandName), "%s", p->argv[0]);
         pthread_mutex_unlock(&ownedStreamsMutex);
         pthread_mutex_lock(&nativeDirectoryMutex);
         if (p->nativeTracked) p->nativeThread = pthread_self();
@@ -3316,6 +3341,37 @@ void ios_activateChildStreams(FILE** old_stdin, FILE** old_stdout,  FILE ** old_
         thread_stderr = child_stderr;
         child_stderr = NULL;
     }
+}
+
+// The main terminal has no PTY line discipline. Reuse Dash's job publication
+// and preserve raw ETX for editors; only a foreground Git job is consumed here.
+__attribute__((visibility("default"))) int ashell_pane_exchange_foreground_pid(int pid) {
+    int previous = currentSession ? atomic_exchange(&currentSession->foregroundPid, pid) : 0;
+    int (*host_exchange)(int) = dlsym(RTLD_MAIN_ONLY, "herdr_pane_exchange_foreground_pid");
+    if (host_exchange) host_exchange(pid);
+    return previous;
+}
+__attribute__((visibility("default"))) int ashell_interrupt_foreground(void) {
+    if (!currentSession) return ESRCH;
+    const char *name = ios_progname();
+    const char *base = name ? strrchr(name, '/') : NULL;
+    if (!name || strcmp(base ? base + 1 : name, "git")) return ENOTSUP;
+    int pid = atomic_load(&currentSession->foregroundPid);
+    if (pid <= 0) return ENOTSUP;
+    int error = ios_spawn_cancel(pid);
+    if (error != ESRCH) return error;
+    // Stock Dash ios_execv roots are not nativeLaunch. Cancelling that command
+    // runs its ownership cleanup, which joins its native descendants/helpers.
+    pthread_t thread = ios_getThreadId(pid);
+    if (!thread || thread == (pthread_t)-1 || pthread_equal(thread, pthread_self())) return ESRCH;
+    pthread_mutex_lock(&commandSignalMutex);
+    functionParameters *root = runningSignalCommands;
+    while (root && (root->session != currentSession || root->ownedThread != thread)) root = root->nextSignalCommand;
+    if (!root) { pthread_mutex_unlock(&commandSignalMutex); return ESRCH; }
+    root->nativeCancelled = true;
+    int result = pthread_cancel(thread);
+    pthread_mutex_unlock(&commandSignalMutex);
+    return result;
 }
 
 int ios_kill(void)
