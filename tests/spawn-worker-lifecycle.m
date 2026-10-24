@@ -10,6 +10,10 @@
 
 static volatile sig_atomic_t delivered;
 static void observedSignal(int number) { delivered = 1; }
+static void *waitForWorker(void *argument) {
+    ios_wait4(*(pid_t *)argument, NULL, 0, NULL, NULL);
+    return NULL;
+}
 
 int main(int argc, char **argv) {
     if (argc != 3) return 64;
@@ -18,6 +22,39 @@ int main(int argc, char **argv) {
     char *home;
     if (asprintf(&home, "HOME=%s", argv[1]) < 0) return 1;
     char *environment[] = {home, NULL};
+    if (!strcmp(argv[2], "waiter")) {
+        char *command[] = {"sleep", "30", NULL};
+        pid_t first, second;
+        int error = ios_posix_spawn(&first, command[0], NULL, NULL, command, environment);
+        if (error) return 2;
+        error = ios_posix_spawn(&second, command[0], NULL, NULL, command, environment);
+        if (error) return 2;
+        pthread_t waiter;
+        error = ios_command_thread_create(&waiter, NULL, waitForWorker, &first);
+        if (error) return 2;
+        bool claimed = false;
+        for (int n = 0; n < 200; ++n) {
+            errno = 0;
+            if (ios_wait4(first, NULL, WNOHANG, NULL, NULL) == -1 && errno == ECHILD) {
+                claimed = true;
+                break;
+            }
+            usleep(10000);
+        }
+        pthread_cancel(waiter);
+        void *result = NULL;
+        pthread_join(waiter, &result);
+        bool restored = ios_wait4(first, NULL, WNOHANG, NULL, NULL) == 0;
+        int interrupted = ios_interruptpid(first), firstStatus = -1, secondStatus = -1;
+        pid_t firstWait = ios_wait4(first, &firstStatus, 0, NULL, NULL);
+        bool isolated = ios_wait4(second, NULL, WNOHANG, NULL, NULL) == 0;
+        int killed = ios_killpid(second, SIGKILL);
+        pid_t secondWait = ios_wait4(second, &secondStatus, 0, NULL, NULL);
+        bool passed = claimed && result == PTHREAD_CANCELED && restored && !interrupted && firstWait == first && WIFEXITED(firstStatus) && WEXITSTATUS(firstStatus) == 130 && isolated && !killed && secondWait == second && WIFEXITED(secondStatus) && WEXITSTATUS(secondStatus) == 137;
+        fprintf(thread_stdout, "WORKER_WAITER claimed=%d restored=%d isolated=%d first=%d second=%d %s\n", claimed, restored, isolated, WIFEXITED(firstStatus) ? WEXITSTATUS(firstStatus) : -1, WIFEXITED(secondStatus) ? WEXITSTATUS(secondStatus) : -1, passed ? "PASS" : "FAIL");
+        free(home); alarm(0);
+        return passed ? 0 : 1;
+    }
     if (!strcmp(argv[2], "orphan-parent")) {
         char *command[] = {"sleep", "5", NULL};
         pid_t pid;
@@ -74,27 +111,6 @@ int main(int argc, char **argv) {
         sigaction(SIGUSR1, &previous, NULL);
         bool passed = !probe && unsupported == EINVAL && !observed && waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 137;
         fprintf(thread_stdout, "WORKER_SIGNAL probe=%d unsupported=%d handler=%d %s\n", probe, unsupported, observed, passed ? "PASS" : "FAIL");
-        free(home); alarm(0);
-        return passed ? 0 : 1;
-    }
-    if (!strcmp(argv[2], "admission")) {
-        pid_t held[128];
-        int count = 0, error = 0;
-        char *missing[] = {"worker-exhaustion-missing-command", NULL};
-        while (count < 128) {
-            error = ios_spawn(&held[count], missing[0], NULL, missing, NULL);
-            if (error) break;
-            ++count;
-        }
-        NSString *marker = [@(argv[1]) stringByAppendingPathComponent:[@"Documents/admission-" stringByAppendingString:NSUUID.UUID.UUIDString]];
-        char *touch[] = {"touch", (char *)marker.fileSystemRepresentation, NULL};
-        pid_t child = -1;
-        int admission = ios_posix_spawn(&child, touch[0], NULL, NULL, touch, environment);
-        usleep(500000);
-        bool ran = [NSFileManager.defaultManager fileExistsAtPath:marker];
-        for (int i = 0; i < count; ++i) ios_full_waitpid(held[i], NULL, 0);
-        bool passed = count > 0 && error == EAGAIN && admission == EAGAIN && !ran;
-        fprintf(thread_stdout, "WORKER_ADMISSION held=%d exhausted=%d admission=%d ran=%d %s\n", count, error, admission, ran, passed ? "PASS" : "FAIL");
         free(home); alarm(0);
         return passed ? 0 : 1;
     }

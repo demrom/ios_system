@@ -19,8 +19,11 @@ int ios_posix_spawn_file_actions_destroy(ios_posix_spawn_file_actions_t *);
 int ios_posix_spawn_file_actions_adddup2(ios_posix_spawn_file_actions_t *, int, int);
 int ios_posix_spawn_file_actions_addclose(ios_posix_spawn_file_actions_t *, int);
 int ios_posix_spawn_file_actions_addchdir_np(ios_posix_spawn_file_actions_t *, const char *);
-/* A returning native parent cancels and reaps its unreaped worker children. */
+/* When the command owning the caller's PID returns, its unreaped worker
+ * children are interrupted (status 130) and reaped. */
 int ios_posix_spawn(pid_t *, const char *, const ios_posix_spawn_file_actions_t *, const void *, char *const [], char *const []);
+/* Worker PIDs accept 0 (probe) and SIGINT/SIGTERM/SIGKILL/SIGHUP/SIGQUIT;
+ * other signals return EINVAL. ios_interruptpid interrupts only the named PID. */
 int ios_killpid(pid_t, int);
 int ios_interruptpid(pid_t);
 /* Wait for an ios_posix_spawn PID; options is 0 or WNOHANG. Returns PID, 0 while
