@@ -254,6 +254,8 @@ extern pid_t ios_forkNative(void);
 extern pid_t ios_dispatchedPid(void);
 extern void ios_notifyThreadCompletion(void);
 extern void ios_bindNativePid(pid_t pid);
+extern void ios_bindCommandPid(pid_t pid);
+extern pid_t ios_takeLegacyDispatchParent(void);
 extern void storeEnvironment(char *envp[]);
 static bool usesSessionStatus(void);
 void ios_exit(int n) {
@@ -411,6 +413,7 @@ typedef struct _functionParameters {
     char *leasedImage;
     pid_t nativePid;
     pid_t ownerPid;
+    pid_t dispatchPid;
     bool nativeStreams, nativeBorrowed;
     unsigned cancelStreams;
     int nativeDescriptors[3];
@@ -1042,6 +1045,7 @@ static void failCommandLaunch(functionParameters *parameters, int error) {
 
 static int createOwnedCommand(volatile pthread_t *thread, functionParameters *parameters) {
     parameters->ownerPid = currentCommand ? currentCommand->ownerPid : 0;
+    parameters->dispatchPid = ios_currentPid();
     if (!parameters->nativeTracked && currentCommand && currentCommand->nativeTracked) {
         pthread_mutex_lock(&nativeDirectoryMutex);
         parameters->nativeParent = currentCommand;
@@ -1794,6 +1798,7 @@ static void* run_function(void* parameters) {
     currentCommand = p;
     if (p->storeLastThread) p->session->lastThreadId = pthread_self();
     ios_bindNativePid(p->nativePid);
+    ios_bindCommandPid(p->dispatchPid);
     currentWebAssemblyCommandOrder = p->webAssemblyOrder;
     p->commandStarted = true;
     currentOwnedStreams = p->ownedStreams;
@@ -1801,7 +1806,7 @@ static void* run_function(void* parameters) {
           (p->stdin == nil) ? -1 : fileno(p->stdin),
           (p->stdout == nil) ? -1 : fileno(p->stdout),
           (p->stderr == nil) ? -1 : fileno(p->stderr), p->argv[0]);
-    ios_storeThreadId(pthread_self());
+    ios_storeThreadIdForPid(ios_currentPid(), pthread_self());
     pid_t registeredPid = p->nativePid >= 0 ? p->nativePid : ios_dispatchedPid();
     // An unforked nested command keeps its caller's environment without owning its PID.
     if (registeredPid > 0) p->ownerPid = registeredPid;
@@ -4904,12 +4909,14 @@ int ios_system(const char *inputCmd) {
     extern pid_t ios_takeNativeDispatchParent(void);
     extern int ios_takeLegacyDispatchCancellation(void);
     pid_t caller = ios_takeNativeDispatchParent();
+    pid_t legacyCaller = ios_takeLegacyDispatchParent();
     int forkCancellation = ios_takeLegacyDispatchCancellation();
     int cancellation;
     // Preserve the caller's cancellation state across legacy dispatch.
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
     int result = dispatchShellCommand(inputCmd);
     if (caller >= 0) ios_bindNativePid(caller);
+    if (legacyCaller >= 0) ios_bindCommandPid(legacyCaller);
     ios_takeLegacyDispatchCancellation();
     pthread_setcancelstate(forkCancellation >= 0 ? forkCancellation : cancellation, NULL);
     return result;
