@@ -229,79 +229,19 @@ static int wait_status(pid_t pid) {
         atomic_load(&command_status[pid]) : ios_getCommandStatus();
 }
 
-// Published snapshots are immutable. PID slots and exposing threads own references.
-// Returned pointers remain valid until the reading command thread exits.
-typedef struct environmentSnapshot {
-    size_t references, count;
-    char *values[];
-} environmentSnapshot;
-static environmentSnapshot *environment[IOS_MAX_THREADS];
-static environmentSnapshot *copyEnvironment[IOS_MAX_THREADS];
-static pthread_mutex_t environment_mtx = PTHREAD_MUTEX_INITIALIZER;
-typedef struct environmentBorrow {
-    environmentSnapshot *snapshot;
-    struct environmentBorrow *next;
-} environmentBorrow;
-static pthread_key_t environment_key;
-static pthread_once_t environment_once = PTHREAD_ONCE_INIT;
-
-static void releaseEnvironmentLocked(environmentSnapshot *snapshot) {
-    if (!snapshot || --snapshot->references) return;
-    for (size_t i = 0; i < snapshot->count; i++) free(snapshot->values[i]);
-    free(snapshot);
-}
-static void releaseEnvironmentBorrows(void *context) {
-    environmentBorrow *borrow = context;
-    pthread_mutex_lock(&environment_mtx);
-    while (borrow) {
-        environmentBorrow *next = borrow->next;
-        releaseEnvironmentLocked(borrow->snapshot);
-        free(borrow);
-        borrow = next;
-    }
-    pthread_mutex_unlock(&environment_mtx);
-}
-static void createEnvironmentKey(void) {
-    if (pthread_key_create(&environment_key, releaseEnvironmentBorrows)) abort();
-}
-// Hold environment_mtx while cloning a publication or changing a slot.
-static environmentSnapshot *copyEnvironmentValues(char *const values[]) {
-    size_t count = 0;
-    while (values[count]) count++;
-    environmentSnapshot *snapshot = malloc(sizeof(*snapshot) + (count + 1) * sizeof(char *));
-    if (!snapshot) return NULL;
-    snapshot->references = 1;
-    snapshot->count = 0;
-    for (size_t i = 0; i < count; i++) {
-        char *value = strdup(values[i]);
-        if (!value) { releaseEnvironmentLocked(snapshot); return NULL; }
-        snapshot->values[snapshot->count++] = value;
-    }
-    snapshot->values[count] = NULL;
-    return snapshot;
-}
-static void publishEnvironmentLocked(pid_t pid, environmentSnapshot *snapshot) {
-    environmentSnapshot *old = environment[pid];
-    environment[pid] = snapshot;
-    releaseEnvironmentLocked(old);
-}
+static int numVariablesSet[IOS_MAX_THREADS];
+static char** environment[IOS_MAX_THREADS];
+static char** copyEnvironment[IOS_MAX_THREADS];
 static char previousDirectory[IOS_MAX_THREADS][MAXPATHLEN];
 static int previousPid[IOS_MAX_THREADS];
 
 static int pid_overflow = 0;
-static __thread pid_t current_pid = 0;
-static __thread pid_t legacy_dispatch_parent = -1;
+static pid_t current_pid = 0;
 static __thread pid_t dispatched_pid;
 static __thread pid_t native_pid = -1;
 static __thread pid_t native_dispatch_parent = -1;
 static __thread int legacy_dispatch_cancellation = -1;
 
-void ios_bindCommandPid(pid_t pid) { current_pid = pid; }
-pid_t ios_takeLegacyDispatchParent(void) {
-    pid_t parent = legacy_dispatch_parent;
-    legacy_dispatch_parent = -1;
-    return parent;
-}
 pid_t ios_nativePid(void) { return native_pid; }
 pid_t ios_dispatchedPid(void) { return dispatched_pid; }
 void ios_bindNativePid(pid_t pid) { native_pid = pid; native_dispatch_parent = -1; }
@@ -315,7 +255,7 @@ int ios_takeLegacyDispatchCancellation(void) {
     legacy_dispatch_cancellation = -1;
     return state;
 }
-// Serialize PID allocation and dispatch registration.
+// We need to lock current_pid during operations
 pthread_mutex_t pid_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pid_registered = PTHREAD_COND_INITIALIZER;
 static pid_t legacy_registration_pid;
@@ -363,18 +303,13 @@ void ios_reapNativeChildren(pid_t parent) {
 
 void makeGlobal(void) {
     pid_t pid = ios_currentPid();
-    pthread_mutex_lock(&environment_mtx);
-    releaseEnvironmentLocked(copyEnvironment[pid]);
     copyEnvironment[pid] = environment[pid];
     environment[pid] = NULL; // makes it really global
-    pthread_mutex_unlock(&environment_mtx);
 }
 void makeLocal(void) {
     pid_t pid = ios_currentPid();
-    pthread_mutex_lock(&environment_mtx);
-    publishEnvironmentLocked(pid, copyEnvironment[pid]);
+    environment[pid] = copyEnvironment[pid];
     copyEnvironment[pid] = NULL;
-    pthread_mutex_unlock(&environment_mtx);
 }
 
 inline pthread_t ios_getThreadId(pid_t pid) {
@@ -391,7 +326,7 @@ void newPreviousDirectory(void) {
 
 // We do not recycle process ids too quickly to avoid collisions.
 void storeEnvironment(char* envp[]);
-static int storeEnvironmentForPid(char *const envp[], pid_t pid);
+static void storeEnvironmentForPid(char *const envp[], pid_t pid);
 static inline pid_t ios_nextAvailablePid(bool native) {
     while (cleanup_counter > 0) { } // Don't start a command while another is ending.
     int cancellation = -1;
@@ -400,9 +335,9 @@ static inline pid_t ios_nextAvailablePid(bool native) {
         legacy_dispatch_cancellation = cancellation;
     }
     // fprintf(stderr, "Locking in ios_nextAvailablePid\n");
-    char** currentEnvironment = environmentVariables(ios_currentPid());
     pthread_mutex_lock(&pid_mtx);
     while (legacy_registration_pid) pthread_cond_wait(&pid_registered, &pid_mtx);
+    char** currentEnvironment = environmentVariables(ios_currentPid());
     int previousPidId = ios_currentPid();
     pid_t allocatedPid;
     if (!pid_overflow && (last_allocated_pid < IOS_MAX_THREADS - 1)
@@ -410,15 +345,16 @@ static inline pid_t ios_nextAvailablePid(bool native) {
         && !native_reservations[last_allocated_pid+1]) {
         allocatedPid = last_allocated_pid + 1;
         last_allocated_pid = allocatedPid;
-        if (storeEnvironmentForPid(currentEnvironment, allocatedPid)) goto allocationFailed;
         native_reservations[allocatedPid] = native;
         command_status[allocatedPid] = 130; // Cancellation before a recorded exit.
         ios_resetPidWorkerState(allocatedPid);
         thread_ids[allocatedPid] = -1; // Not yet started
+        numVariablesSet[allocatedPid] = 0;
+        environment[allocatedPid] = NULL;
+        storeEnvironmentForPid(currentEnvironment, allocatedPid); // duplicate the environment variables
         getwd(previousDirectory[allocatedPid]); // store current working directory
         previousPid[allocatedPid] = previousPidId;
         if (!native && native_pid < 0) {
-            legacy_dispatch_parent = current_pid;
             current_pid = allocatedPid;
             legacy_registration_pid = allocatedPid;
         }
@@ -450,15 +386,16 @@ static inline pid_t ios_nextAvailablePid(bool native) {
         }
         pthread_t thread_pid = ios_getThreadId(allocatedPid);
         if (thread_pid == 0 && !native_reservations[allocatedPid]) { // We found a not-active pid
-            if (storeEnvironmentForPid(currentEnvironment, allocatedPid)) goto allocationFailed;
             native_reservations[allocatedPid] = native;
             command_status[allocatedPid] = 130; // Cancellation before a recorded exit.
             ios_resetPidWorkerState(allocatedPid);
             thread_ids[allocatedPid] = -1; // Not yet started
+            numVariablesSet[allocatedPid] = 0;
+            environment[allocatedPid] = NULL;
+            storeEnvironmentForPid(currentEnvironment, allocatedPid); // duplicate the environment variables
             getwd(previousDirectory[allocatedPid]); // store current working directory
             previousPid[allocatedPid] = previousPidId;
             if (!native && native_pid < 0) {
-                legacy_dispatch_parent = current_pid;
                 current_pid = allocatedPid;
                 legacy_registration_pid = allocatedPid;
             }
@@ -478,16 +415,10 @@ static inline pid_t ios_nextAvailablePid(bool native) {
         }
         */
     }
-allocationFailed:
-    pthread_mutex_unlock(&pid_mtx);
-    if (!native) {
-        legacy_dispatch_cancellation = -1;
-        pthread_setcancelstate(cancellation, NULL);
-    }
-    return -1;
 }
 
-static void storeThreadIdLocked(pid_t pid, pthread_t thread) {
+void ios_storeThreadIdForPid(pid_t pid, pthread_t thread) {
+    pthread_mutex_lock(&pid_mtx);
     // To avoid issues when a command starts a command without forking,
     // we only store thread IDs for the first thread of the "process".
     // fprintf(stderr, "Unlocking pid %d, storing thread %x current value: %x\n", current_pid, thread,  thread_ids[pid]);
@@ -500,184 +431,268 @@ static void storeThreadIdLocked(pid_t pid, pthread_t thread) {
         legacy_registration_pid = 0;
         pthread_cond_broadcast(&pid_registered);
     }
-}
-
-void ios_storeThreadIdForPid(pid_t pid, pthread_t thread) {
-    pthread_mutex_lock(&pid_mtx);
-    storeThreadIdLocked(pid, thread);
     pthread_mutex_unlock(&pid_mtx);
 }
 
-void ios_storeThreadId(pthread_t thread) {
-    pthread_mutex_lock(&pid_mtx);
-    pid_t pid = ios_currentPid();
-    // A manually created legacy pthread has no inherited TLS. Bind once at
-    // registration to the reservation that prevents the next legacy dispatch.
-    if (pid == 0 && thread && pthread_equal(thread, pthread_self()) && legacy_registration_pid) {
-        pid = legacy_registration_pid;
-        current_pid = pid;
-    }
-    storeThreadIdLocked(pid, thread);
-    pthread_mutex_unlock(&pid_mtx);
+inline void ios_storeThreadId(pthread_t thread) {
+    ios_storeThreadIdForPid(ios_currentPid(), thread);
 }
 
-
-static char **localEnvironmentVariables(pid_t pid);
 
 char* libc_getenv(const char* variableName) {
-    if (!variableName || !*variableName) return NULL;
-    char **values = localEnvironmentVariables(ios_currentPid());
-    if (!values) return getenv(variableName);
-    size_t length = strlen(variableName);
-    for (size_t i = 0; values[i]; i++) {
-        if (strncmp(values[i], variableName, length) == 0 && values[i][length] == '=')
-            return values[i] + length + 1;
+    pid_t pid = ios_currentPid();
+    if (environment[pid] != NULL) {
+        if (variableName == NULL) { return NULL; }
+        // fprintf(stderr, "libc_getenv: %s\n", variableName); fflush(stderr);
+        char** envp = environment[pid];
+        unsigned long varNameLen = strlen(variableName);
+        if (varNameLen == 0) { return NULL; }
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
+            if (envp[i] == NULL) { continue; }
+            if (strlen(envp[i]) < varNameLen) { continue; }
+            if (strncmp(variableName, envp[i], varNameLen) == 0) {
+                if (strlen(envp[i]) > varNameLen) {
+                    if (envp[i][varNameLen] == '=') {
+                        return envp[i] + varNameLen + 1;
+                    }
+                }
+            }
+            /*
+            char* position = strchr(envp[i],'=');
+            if (strncmp(variableName, envp[i], position - envp[i]) == 0) {
+                char* value = position + 1;
+                return value;
+            }
+             */
+        }
+        return NULL;
+    } else {
+        return getenv(variableName);
     }
-    return NULL;
 }
 
 extern void set_session_errno(int n);
-extern char **environ;
-
-// Construct replacements without reallocating storage already exposed to readers.
-static int changeEnvironment(const char *name, const char *value, int overwrite, pid_t pid) {
-    if (!name || !*name || strchr(name, '=')) { set_session_errno(EINVAL); return -1; }
-    pthread_mutex_lock(&environment_mtx);
-    environmentSnapshot *old = environment[pid];
-    if (!old) {
-        int result = value ? setenv(name, value, overwrite) : unsetenv(name);
-        pthread_mutex_unlock(&environment_mtx);
-        return result;
-    }
-    size_t length = strlen(name), position = old->count;
-    for (size_t i = 0; i < old->count; i++) {
-        if (strncmp(old->values[i], name, length) == 0 && old->values[i][length] == '=') {
-            position = i;
-            break;
+int ios_setenv_pid(const char* variableName, const char* value, int overwrite, int pid) {
+    if (environment[pid] != NULL) {
+        if (variableName == NULL) {
+            set_session_errno(EINVAL);
+            return -1;
         }
-    }
-    if ((position < old->count && value && !overwrite) || (position == old->count && !value)) {
-        pthread_mutex_unlock(&environment_mtx);
-        return 0;
-    }
-    size_t count = old->count + (position == old->count ? 1 : 0) - (value ? 0 : 1);
-    environmentSnapshot *snapshot = malloc(sizeof(*snapshot) + (count + 1) * sizeof(char *));
-    if (snapshot) {
-        snapshot->references = 1;
-        snapshot->count = 0;
-        for (size_t i = 0; i < old->count; i++) {
-            if (i == position) continue;
-            char *entry = strdup(old->values[i]);
-            if (!entry) { releaseEnvironmentLocked(snapshot); snapshot = NULL; break; }
-            snapshot->values[snapshot->count++] = entry;
+        if (strlen(variableName) == 0) {
+            set_session_errno(EINVAL);
+            return -1;
         }
-        if (snapshot && value) {
-            char *entry = malloc(length + strlen(value) + 2);
-            if (!entry) { releaseEnvironmentLocked(snapshot); snapshot = NULL; }
-            else {
-                sprintf(entry, "%s=%s", name, value);
-                snapshot->values[snapshot->count++] = entry;
+        char* position = strchr(variableName,'=');
+        if (position != NULL) {
+            set_session_errno(EINVAL);
+            return -1;
+        }
+        char** envp = environment[pid];
+        unsigned long varNameLen = strlen(variableName);
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
+            if (envp[i] == NULL) { continue; }
+            if (strncmp(variableName, envp[i], varNameLen) == 0) {
+                if (strlen(envp[i]) > varNameLen) {
+                    if (envp[i][varNameLen] == '=') {
+                        // This variable is defined in the current environment:
+                        if (overwrite == 0) { return 0; }
+                        envp[i] = realloc(envp[i], strlen(variableName) + strlen(value) + 2);
+                        sprintf(envp[i], "%s=%s", variableName, value);
+                        return 0;
+                    }
+                }
             }
         }
+        // Not found so far, add it to the list:
+        int pos = numVariablesSet[pid];
+        environment[pid] = realloc(envp, (numVariablesSet[pid] + 2) * sizeof(char*));
+        environment[pid][pos] = malloc(strlen(variableName) + strlen(value) + 2);
+        environment[pid][pos + 1] = NULL;
+        sprintf(environment[pid][pos], "%s=%s", variableName, value);
+        numVariablesSet[pid] += 1;
+        return 0;
+    } else {
+        return setenv(variableName, value, overwrite);
     }
-    if (snapshot) {
-        snapshot->values[snapshot->count] = NULL;
-        publishEnvironmentLocked(pid, snapshot);
-    }
-    pthread_mutex_unlock(&environment_mtx);
-    if (!snapshot) { set_session_errno(ENOMEM); return -1; }
-    return 0;
 }
 
-int ios_setenv_pid(const char* name, const char* value, int overwrite, int pid) {
-    if (!value) { set_session_errno(EINVAL); return -1; }
-    return changeEnvironment(name, value, overwrite, pid);
+int ios_setenv_parent(const char* variableName, const char* value, int overwrite) {
+    pid_t pid = ios_currentPid();
+    return ios_setenv_pid(variableName, value, overwrite, previousPid[pid]);
 }
-int ios_setenv_parent(const char* name, const char* value, int overwrite) {
-    return ios_setenv_pid(name, value, overwrite, previousPid[ios_currentPid()]);
+
+int ios_setenv(const char* variableName, const char* value, int overwrite) {
+    pid_t pid = ios_currentPid();
+    return ios_setenv_pid(variableName, value, overwrite, pid);
 }
-int ios_setenv(const char* name, const char* value, int overwrite) {
-    return ios_setenv_pid(name, value, overwrite, ios_currentPid());
-}
+
 int ios_putenv(char* string) {
-    pthread_mutex_lock(&environment_mtx);
-    if (!environment[ios_currentPid()]) {
-        int result = putenv(string);
-        pthread_mutex_unlock(&environment_mtx);
-        return result;
-    }
-    pthread_mutex_unlock(&environment_mtx);
-    char *equals = string ? strchr(string, '=') : NULL;
-    if (!equals) { set_session_errno(EINVAL); return -1; }
-    char *name = strndup(string, equals - string);
-    if (!name) { set_session_errno(ENOMEM); return -1; }
-    int result = ios_setenv(name, equals + 1, 1);
-    free(name);
-    return result;
-}
-int ios_unsetenv_pid(const char* name, int pid) {
-    return changeEnvironment(name, NULL, 1, pid);
-}
-int ios_unsetenv_parent(const char* name) {
-    return ios_unsetenv_pid(name, previousPid[ios_currentPid()]);
-}
-int ios_unsetenv(const char* name) {
-    return ios_unsetenv_pid(name, ios_currentPid());
-}
+    pid_t pid = ios_currentPid();
+    if (environment[pid] != NULL) {
+        unsigned length;
+        char     *temp;
 
-// Copy completely before publication; allocation failure leaves the slot intact.
-static int storeEnvironmentForPid(char *const envp[], pid_t pid) {
-    pthread_mutex_lock(&environment_mtx);
-    environmentSnapshot *snapshot = copyEnvironmentValues(envp);
-    if (!snapshot) { pthread_mutex_unlock(&environment_mtx); errno = ENOMEM; return -1; }
-    publishEnvironmentLocked(pid, snapshot);
-    pthread_mutex_unlock(&environment_mtx);
-    return 0;
-}
-void storeEnvironment(char* envp[]) {
-    if (storeEnvironmentForPid(envp, ios_currentPid())) abort();
-}
-void resetEnvironment(pid_t pid) {
-    pthread_mutex_lock(&environment_mtx);
-    publishEnvironmentLocked(pid, NULL);
-    pthread_mutex_unlock(&environment_mtx);
-}
-// Used by env -i: keep an empty local environment rather than selecting environ.
-void clearEnvironment(pid_t pid) {
-    pthread_mutex_lock(&environment_mtx);
-    if (environment[pid]) {
-        char *empty[] = {NULL};
-        environmentSnapshot *snapshot = copyEnvironmentValues(empty);
-        if (!snapshot) { pthread_mutex_unlock(&environment_mtx); abort(); }
-        publishEnvironmentLocked(pid, snapshot);
-    }
-    pthread_mutex_unlock(&environment_mtx);
-}
-
-static char **localEnvironmentVariables(pid_t pid) {
-    pthread_once(&environment_once, createEnvironmentKey);
-    pthread_mutex_lock(&environment_mtx);
-    environmentSnapshot *snapshot = environment[pid];
-    if (!snapshot) { pthread_mutex_unlock(&environment_mtx); return NULL; }
-    environmentBorrow *head = pthread_getspecific(environment_key);
-    for (environmentBorrow *borrow = head; borrow; borrow = borrow->next) {
-        if (borrow->snapshot == snapshot) {
-            pthread_mutex_unlock(&environment_mtx);
-            return snapshot->values;
+        /*  Find the length of the "NAME="  */
+        temp = strchr(string,'=');
+        if ( temp == 0 ) {
+            set_session_errno(EINVAL);
+            return( -1 );
         }
+        length = (unsigned) (temp - string + 1);
+
+        /*  Scan through the environment looking for "NAME="  */
+        char** envp = environment[pid];
+
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
+            if (envp[i] == NULL) { continue; }
+            if ( strncmp( string, envp[i], length ) == 0 ) {
+                // Found it. Copy in place.
+                envp[i] = realloc(envp[i], strlen(string) + 1);
+                memcpy(envp[i], string, strlen(string) + 1);
+                return 0;
+            }
+        }
+        // Not found so far, add it to the list:
+        int pos = numVariablesSet[pid];
+        environment[pid] = realloc(envp, (numVariablesSet[pid] + 2) * sizeof(char*));
+        environment[pid][pos] = malloc(strlen(string) + 1);
+        environment[pid][pos + 1] = NULL;
+        memcpy(environment[pid][pos], string, strlen(string) + 1);
+        numVariablesSet[pid] += 1;
+        return 0;
+    } else {
+        return putenv(string);
     }
-    environmentBorrow *borrow = malloc(sizeof(*borrow));
-    if (!borrow) { pthread_mutex_unlock(&environment_mtx); abort(); }
-    *borrow = (environmentBorrow){snapshot, head};
-    if (pthread_setspecific(environment_key, borrow)) { free(borrow); pthread_mutex_unlock(&environment_mtx); abort(); }
-    snapshot->references++;
-    pthread_mutex_unlock(&environment_mtx);
-    return snapshot->values;
 }
+
+int ios_unsetenv_pid(const char* variableName, int pid) {
+    // Someone calls unsetenv once the process has been terminated.
+    // Best thing to do is erase the environment and return
+    if (environment[pid] != NULL) {
+        if (variableName == NULL) {
+            set_session_errno(EINVAL);
+            return -1;
+        }
+        if (strlen(variableName) == 0) {
+            set_session_errno(EINVAL);
+            return -1;
+        }
+        char* position = strchr(variableName,'=');
+        if (position != NULL) {
+            set_session_errno(EINVAL);
+            return -1;
+        }
+        char** envp = environment[pid];
+        unsigned long varNameLen = strlen(variableName);
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
+            if (envp[i] == NULL) { continue; }
+            if (strncmp(variableName, envp[i], varNameLen) == 0) {
+                if (strlen(envp[i]) > varNameLen) {
+                    if (envp[i][varNameLen] == '=') {
+                        // This variable is defined in the current environment:
+                        free(envp[i]);
+                        envp[i] = NULL;
+                        if (i < numVariablesSet[pid] - 1) {
+                            for (int j = i; j < numVariablesSet[pid] - 1; j++) {
+                                envp[j] = envp[j+1];
+                            }
+                            envp[numVariablesSet[pid] - 1] = NULL;
+                        }
+                        numVariablesSet[pid] -= 1;
+                        environment[pid] = realloc(envp, (numVariablesSet[pid] + 1) * sizeof(char*));
+                        return 0;
+                    }
+                }
+            }
+        }
+        /*
+         for (int i = 0; i < numVariablesSet[pid]; i++) {
+         char* position = strstr(envp[i],"=");
+         if (strncmp(variableName, envp[i], position - envp[i]) == 0) {
+         }
+         } */
+        // Not found:
+        return 0;
+    } else {
+        return unsetenv(variableName);
+    }
+}
+
+int ios_unsetenv_parent(const char* variableName) {
+    pid_t pid = ios_currentPid();
+    return ios_unsetenv_pid(variableName, previousPid[pid]);
+}
+
+int ios_unsetenv(const char* variableName) {
+    pid_t pid = ios_currentPid();
+    return ios_unsetenv_pid(variableName, pid);
+}
+
+
+// store environment variables (called from execve)
+// Copy the entire environment:
+extern char** environ;
+void resetEnvironment(pid_t pid);
+static void storeEnvironmentForPid(char *const envp[], pid_t pid) {
+    if (environment[pid] != NULL) {
+        // We already allocated one environment. Let's clean it:
+        resetEnvironment(pid);
+    }
+    int i = 0;
+    while (envp[i] != NULL) {
+        i++;
+    }
+    numVariablesSet[pid] = i;
+    environment[pid] = malloc((numVariablesSet[pid] + 1) * sizeof(char*));
+    for (int i = 0; i < numVariablesSet[pid]; i++) {
+        if (envp[i] != NULL)
+            environment[pid][i] = strdup(envp[i]);
+        else
+            environment[pid][i] = NULL;
+    }
+    // Keep NULL-termination:
+    environment[pid][numVariablesSet[pid]] = NULL;
+}
+
+void storeEnvironment(char* envp[]) {
+    storeEnvironmentForPid(envp, ios_currentPid());
+}
+
+// when the command is terminated, release the environment variables that were added.
+void resetEnvironment(pid_t pid) {
+    if (environment[pid] != NULL) {
+        // Free the variables allocated:
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
+            if (environment[pid][i] == NULL) { continue; }
+            free(environment[pid][i]);
+            environment[pid][i] = NULL;
+        }
+        free(environment[pid]);
+        environment[pid] = NULL;
+        numVariablesSet[pid] = 0;
+    }
+}
+
+// Used by "env -i": clear all environment variables, but don't clear the environment itself
+void clearEnvironment(pid_t pid) {
+    if (environment[pid] != NULL) {
+        // Free the variables allocated:
+        for (int i = 0; i < numVariablesSet[pid]; i++) {
+            if (environment[pid][i] == NULL) { continue; }
+            free(environment[pid][i]);
+            environment[pid][i] = NULL;
+        }
+        numVariablesSet[pid] = 0;
+    }
+}
+
 
 char** environmentVariables(pid_t pid) {
-    char **values = localEnvironmentVariables(pid);
-    return values ? values : environ;
+    if (environment[pid] != NULL) {
+        return environment[pid];
+    } else {
+        return environ;
+    }
 }
 
 extern int chdir_nolock(const char* path); // defined in ios_system.m
