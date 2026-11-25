@@ -51,8 +51,7 @@ void finishedPreparingWebAssemblyCommand(void) {
 }
 
 static void executeWebAssemblyCommandsInOrder(void) {
-    static _Atomic(void (*)(void)) cachedFunction = NULL;
-    void (*function)(void) = atomic_load(&cachedFunction);
+    static void (*function)(void) = NULL;
     if (function == NULL) {
         function = dlsym(RTLD_MAIN_ONLY, "executeWebAssemblyCommands");
     }
@@ -60,7 +59,6 @@ static void executeWebAssemblyCommandsInOrder(void) {
         // more extensive search, but more expensive too.
         function = dlsym(RTLD_DEFAULT, "executeWebAssemblyCommands");
     }
-    atomic_store(&cachedFunction, function);
     if (function != NULL) {
         while (preparingWebAssemblyCommands > 0) {
             // Empty loops create problems in Release mode.

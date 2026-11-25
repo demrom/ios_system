@@ -86,7 +86,7 @@ typedef struct _sessionParameters {
     FILE* tty;
     bool nativeTTY; // Native jobs use the actual descriptor terminal state.
     const void* context;
-    _Atomic int global_errno; // written by command threads, read by the caller of ios_system
+    int global_errno;
     int numCommandsAllocated;
     int numCommand;
     char** commandName;
