@@ -8,7 +8,9 @@ work=$(mktemp -d "$logs/run.XXXXXX")
 work=$(cd "$work" && pwd)
 arch=$(uname -m)
 cc=(xcrun --sdk iphonesimulator clang -target "$arch-apple-ios16.0-simulator")
-if ! xcodebuild -project "$root/ios_system.xcodeproj" -scheme ios_system -configuration Debug \
+# Debug command tracing drowned out the concurrent workload on hosted Intel.
+# Keep the original fixture's command count and alarm, with TSan on Release.
+if ! xcodebuild -project "$root/ios_system.xcodeproj" -scheme ios_system -configuration Release \
     -destination 'generic/platform=iOS Simulator' -derivedDataPath "$work/build" \
     ARCHS="$arch" CODE_SIGNING_ALLOWED=NO ENABLE_THREAD_SANITIZER=YES build > "$work/build.log" 2>&1; then
     tail -60 "$work/build.log" >&2
@@ -16,7 +18,7 @@ if ! xcodebuild -project "$root/ios_system.xcodeproj" -scheme ios_system -config
 fi
 frameworks="$work/Frameworks"
 mkdir "$frameworks"
-cp -R "$work/build/Build/Products/Debug-iphonesimulator/ios_system.framework" "$frameworks/"
+cp -R "$work/build/Build/Products/Release-iphonesimulator/ios_system.framework" "$frameworks/"
 cp "$root/Resources/commandDictionary.plist" "$work/"
 cp "$root/tests/tsan.supp" "$work/"
 runtime_library=$("${cc[@]}" -print-file-name=libclang_rt.tsan_iossim_dynamic.dylib)
