@@ -4778,12 +4778,8 @@ static int dispatchCommand(functionParameters *params, int argc, char **argv, in
                 params->storeLastThread = atomic_compare_exchange_strong(&currentSession->lastThreadId, &empty, pthread_self());
             int error = createOwnedCommand(&_tid_local, params);
             if (launchError) *launchError = error;
-            if (error == 0) {
-                // The last command on the command line (with multiple pipes) will be created first
-                // fprintf(stderr, "Started thread = %x\n", _tid_local);
-                // PID waits observe cleanup independently of pthread joinability.
-                pthread_detach(_tid_local);
-            }
+            // PID completion is still reported, but the auxiliary pthread
+            // remains joinable and nobody reclaims it.
         }
     } else {
         fprintf(params->stderr, "%s: command not found\n", argv[0]);
