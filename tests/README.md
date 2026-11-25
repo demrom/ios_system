@@ -1,3 +1,7 @@
+The `native-spawn-tests.yml` workflow runs the standalone native-spawn, wait, cancellation and environment consumers on Intel Simulator. After building the `ios_system` and `shell` schemes, run `bash tests/native-spawn-ci.sh PRODUCTS [LOGS]`, where `PRODUCTS` is the `Release-iphonesimulator` directory. The driver installs no global tools; it uses WABT 1.0.39 via `npx` to assemble the checked-in WASI fixture. Its per-case logs record the executable exit status.
+
+Worker-host tests below still require the real a-Shell extension broker; the standalone fixture does not substitute that broker. The auxiliary thread lifetime check requires the separate sanitizer build described below.
+
 # Descriptor limits
 
 `descriptor-limits.m` exercises real command dispatch, pipelines and the native spawn API with a changed process descriptor limit. Build it with the native spawn fixture flags below and keep the command dictionary beside the executable. Run each mode in a separate Simulator process:

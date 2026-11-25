@@ -1,0 +1,41 @@
+name: Native spawn tests
+
+on:
+  pull_request:
+  push:
+    branches: ['ci/native-spawn-tests-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Build the native runtime and Wasm3 interpreter for Simulator
+        shell: bash
+        run: |
+          xcodebuild -version
+          xcodebuild -version | grep -Fx 'Xcode 26.6'
+          for scheme in ios_system shell; do
+            xcodebuild -project ios_system.xcodeproj -scheme "$scheme" -configuration Release -sdk iphonesimulator \
+              -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/spawn-products \
+              ARCHS=x86_64 CODE_SIGNING_ALLOWED=NO IPHONEOS_DEPLOYMENT_TARGET=16.0 -quiet build
+          done
+      - name: Run native spawn, cancellation, and environment regressions
+        run: bash tests/native-spawn-ci.sh .build/spawn-products/Build/Products/Release-iphonesimulator
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-spawn-logs
+          include-hidden-files: true
+          path: .build/native-spawn-ci/run.*/*.log
+          if-no-files-found: ignore
