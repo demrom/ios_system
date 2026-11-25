@@ -8,6 +8,8 @@ on:
   push:
     tags:
     - 'v*'
+    branches:
+    - ci/ios-system-prerelease
 
 permissions:
   contents: read
@@ -19,7 +21,8 @@ defaults:
 jobs:
   build:
     name: Building xcframeworks
-    runs-on: macos-26
+    runs-on: ${{ github.repository == 'demrom/ios_system' && github.ref == 'refs/heads/ci/ios-system-prerelease' && 'macos-26-intel' || 'macos-26' }}
+    timeout-minutes: 120
 
     steps:
     - uses: actions/checkout@v7
@@ -31,10 +34,44 @@ jobs:
       run: xcodebuild -version
 
     - name: build-ios_system
-      run: swift run --verbose --package-path xcfs build
+      env:
+        IOS_ONLY: ${{ github.repository == 'demrom/ios_system' && github.ref == 'refs/heads/ci/ios-system-prerelease' }}
+      run: |
+        set -euo pipefail
+        if [[ "$IOS_ONLY" == true ]]; then
+          swift run --verbose --force-resolved-versions --package-path xcfs build --ios-only
+        else
+          swift run --verbose --package-path xcfs build
+        fi
+
+    - name: Verify fork release archives
+      if: github.repository == 'demrom/ios_system' && github.ref == 'refs/heads/ci/ios-system-prerelease'
+      run: |
+        set -euo pipefail
+        products=(ios_system awk curl_ios files shell ssh_cmd ssh_cmdA ssh_agent sshd tar text)
+        archives=(.build/*.xcframework.zip)
+        test "${#archives[@]}" -eq "${#products[@]}"
+        stage=$(mktemp -d)
+        for product in "${products[@]}"; do
+          zip=".build/$product.xcframework.zip"
+          unzip -tq "$zip"
+          ditto -x -k "$zip" "$stage/$product"
+          bundle="$stage/$product/$product.xcframework"
+          plutil -extract AvailableLibraries json -o - "$bundle/Info.plist" | jq -e '
+            length == 2 and
+            any(.[]; .LibraryIdentifier == "ios-arm64" and .SupportedPlatform == "ios" and
+                (has("SupportedPlatformVariant") | not) and .SupportedArchitectures == ["arm64"]) and
+            any(.[]; .LibraryIdentifier == "ios-arm64_x86_64-simulator" and .SupportedPlatform == "ios" and
+                .SupportedPlatformVariant == "simulator" and (.SupportedArchitectures | sort) == ["arm64", "x86_64"])'
+          device="$bundle/ios-arm64/$product.framework/$product"
+          sim="$bundle/ios-arm64_x86_64-simulator/$product.framework/$product"
+          test "$(xcrun lipo -archs "$device")" = arm64
+          test "$(xcrun lipo -archs "$sim" | tr ' ' '\n' | LC_ALL=C sort | paste -sd, -)" = arm64,x86_64
+        done
 
     - name: Slices and checksums
       run: |
+        set -euo pipefail
         ls .build/*.xcframework.zip >/dev/null
         for zip in .build/*.xcframework.zip; do
           sum=$(swift package compute-checksum "$zip")
@@ -80,7 +117,7 @@ jobs:
       contents: write
 
     steps:
-    - uses: actions/download-artifact@v8
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: xcframeworks
 
@@ -88,8 +125,55 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        set -euo pipefail
         gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
           || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --title "Release $GITHUB_REF_NAME" --notes-file .build/release.md
         gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
           .build/*.xcframework.zip ios_error.h Resources/commandDictionary.plist
+
+  fork-prerelease:
+    name: Publish fork prerelease
+    needs: build
+    if: github.repository == 'demrom/ios_system' && github.event_name == 'push' && github.ref == 'refs/heads/ci/ios-system-prerelease'
+    runs-on: ubuntu-latest
+    concurrency: ios-system-preview-${{ github.sha }}
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+      with:
+        name: xcframeworks
+
+    - name: Publish verified consumer assets
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        tag="ios-system-preview-${GITHUB_SHA:0:12}"
+        (
+          cd .build
+          archives=(*.xcframework.zip)
+          test "${#archives[@]}" -eq 11
+          test "$(wc -l < checksums.txt)" -eq 11
+          diff <(printf '%s\n' "${archives[@]}" | LC_ALL=C sort) \
+               <(awk '{print $2}' checksums.txt | LC_ALL=C sort)
+          sha256sum --strict --check checksums.txt
+        )
+        if draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+          if [[ "$draft" != true ]]; then
+            echo "Release $tag already exists; existing assets were not replaced."
+            exit 1
+          fi
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+        fi
+        if tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null); then
+          test "$tag_sha" = "$GITHUB_SHA"
+        fi
+        gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          --draft --prerelease --latest=false --title "ios_system preview ${GITHUB_SHA:0:12}" \
+          --notes-file .build/release.md
+        gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+          .build/*.xcframework.zip .build/checksums.txt ios_error.h Resources/commandDictionary.plist
+        gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false

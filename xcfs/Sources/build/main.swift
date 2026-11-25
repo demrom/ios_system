@@ -1,13 +1,13 @@
 // use it from root folder:
-// `swift run --package-path xcfs build [all, awk, tar, ios_system, ...]`
+// `swift run --package-path xcfs build [all, awk, tar, ios_system, ...] [--ios-only]`
 
 import FMake
 import class Foundation.ProcessInfo
 
 OutputLevel.default = .error
 
-// TODO: We can add more platforms here
-let platforms: [Platform] = [.iPhoneOS, .iPhoneSimulator, .Catalyst]
+let args = ProcessInfo.processInfo.arguments.dropFirst()
+let platforms: [Platform] = args.contains("--ios-only") ? [.iPhoneOS, .iPhoneSimulator] : [.iPhoneOS, .iPhoneSimulator, .Catalyst]
 
 let allSchemes = [
     "ios_system",
@@ -23,13 +23,10 @@ let allSchemes = [
     "text",
     ]
 
-let args = ProcessInfo.processInfo.arguments 
-
-var schemes: [String] 
-if args.count > 1 && args[1] != "all" {
-    schemes = args[1].components(separatedBy: ",")
-} else {
-    schemes = allSchemes 
+let selection = args.first { $0 != "--ios-only" } ?? "all"
+let schemes = selection == "all" ? allSchemes : selection.components(separatedBy: ",")
+for scheme in schemes where !allSchemes.contains(scheme) {
+    fatalError("Unknown scheme: \(scheme)")
 }
 
 var checksums: [[String?]] = []
@@ -44,6 +41,8 @@ for scheme in schemes {
 
     try cd(".build") {
         let zip = "\(scheme).xcframework.zip"
+        // Updating an existing ZIP can retain stale slices from a previous build.
+        try sh("rm -f \(zip)")
         try sh("zip --symlinks -r \(zip) \(scheme).xcframework")
         let chksum = try sha(path: zip)
         checksums.append([zip, chksum])
