@@ -8,8 +8,12 @@ work=$(mktemp -d "$logs/run.XXXXXX")
 work=$(cd "$work" && pwd)
 arch=$(uname -m)
 cc=(xcrun --sdk iphonesimulator clang -target "$arch-apple-ios16.0-simulator")
-# Debug command tracing drowned out the concurrent workload on hosted Intel.
-# Keep the original fixture's command count and alarm, with TSan on Release.
+# Use Release and retain all 3,200 commands. Hosted Intel completed about
+# 1,170 in 120 seconds; allow 10 minutes for the same instrumented workload.
+watchdog=120
+if [[ $arch == x86_64 ]]; then
+    watchdog=600
+fi
 if ! xcodebuild -project "$root/ios_system.xcodeproj" -scheme ios_system -configuration Release \
     -destination 'generic/platform=iOS Simulator' -derivedDataPath "$work/build" \
     ARCHS="$arch" CODE_SIGNING_ALLOWED=NO ENABLE_THREAD_SANITIZER=YES build > "$work/build.log" 2>&1; then
@@ -23,7 +27,7 @@ cp "$root/Resources/commandDictionary.plist" "$work/"
 cp "$root/tests/tsan.supp" "$work/"
 runtime_library=$("${cc[@]}" -print-file-name=libclang_rt.tsan_iossim_dynamic.dylib)
 cp "$runtime_library" "$frameworks/"
-"${cc[@]}" -fsanitize=thread -fobjc-arc -I"$root/ios_system" -I"$root" -F"$frameworks" \
+"${cc[@]}" "-DCONCURRENT_FORK_WATCHDOG_SECONDS=$watchdog" -fsanitize=thread -fobjc-arc -I"$root/ios_system" -I"$root" -F"$frameworks" \
     -framework ios_system -framework Foundation -Wl,-rpath,@executable_path/Frameworks \
     -Wl,-export_dynamic "$root/tests/concurrent-fork.m" -o "$work/concurrent-fork"
 codesign --force --sign - "$frameworks/ios_system.framework"
