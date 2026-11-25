@@ -1,3 +1,7 @@
+# Standalone Simulator suite
+
+Install jq and an iOS Simulator runtime that supports iPhone 17 (iOS 26 on Intel). Run `swift run --force-resolved-versions --package-path xcfs build ios_system,files,text --ios-only` and then `bash tests/simulator.sh .build .build/simulator-tests` from the repository root. The script compiles the existing consumers for the host's Simulator architecture, creates a disposable iPhone 17 Simulator, and records each command's output and exit status. Worker-broker and sanitizer fixtures retain their separate setup below.
+
 # Session window size
 
 `window-size.m` calls the public session APIs against the real ios_system framework. It checks independent sessions, reading from a thread without session TLS, resize, closed and unknown sessions, invalid arguments and unchanged outputs on errors.
@@ -284,7 +288,7 @@ xcrun simctl spawn "$SIMULATOR_UDID" "$CHECK/command-streams" 'wc -c' "$expected
 
 Also run `wc -l` expecting `       2\n`, `wc -w` expecting `       3\n`, `wc -m` expecting `      14\n`, and `wc` expecting `       2       3      14\n`. Run `grep three`, `egrep three` and `fgrep three` expecting `three\n`; `cksum` expects `112545809 14\n`, and `sum` expects `63079 1\n`. Those checksum literals were independently obtained from the macOS stock commands, not calculated by the implementation under test.
 
-For the `gzip` output-open error, create a disposable input whose basename has 253 ASCII characters. Its `.gz` output exceeds the filesystem's 255-byte basename limit. Pass `"gzip /absolute/path/to/input"`, an empty expected output argument, and expected status `1` as the optional third argument. The command must fail while retaining all three caller streams and leaving the input intact. Remove the disposable input afterwards. Before the fixes, `wc`, `grep`, `cksum`/`sum` and the `gzip` error case leave only two caller descriptors open; after the fixes all cases exit 0 and print `PASS`. The worker-level pipeline regression in `worker-pipeline.sh` independently checks completion and data transfer for gzip/wc workers.
+For the `gzip` output-open error, create a disposable input whose basename has 253 ASCII characters. Its `.gz` output exceeds the filesystem's 255-byte basename limit. Pass `"gzip /absolute/path/to/input"`, an empty expected output argument, and expected status `1` as the optional third argument. Pass `File name too long` as the fourth argument to require the output-open diagnostic. The command must fail while retaining all three caller streams and leaving the input intact. Remove the disposable input afterwards. Before the fixes, `wc`, `grep`, `cksum`/`sum` and the `gzip` error case leave only two caller descriptors open; after the fixes all cases exit 0 and print `PASS`. The worker-level pipeline regression in `worker-pipeline.sh` independently checks completion and data transfer for gzip/wc workers.
 
 # Direct command interruption
 

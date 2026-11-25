@@ -1,0 +1,35 @@
+name: ios_system Simulator tests
+
+on:
+  pull_request:
+  push:
+    branches: ['ci/ios-system-tests-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    runs-on: macos-26-intel
+    timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Build the runtime and command frameworks
+        run: |
+          xcodebuild -version
+          swift run --force-resolved-versions --package-path xcfs build ios_system,files,text --ios-only
+      - name: Run native runtime and command regressions
+        run: bash tests/simulator.sh .build .build/simulator-tests
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: ios-system-simulator-logs
+          include-hidden-files: true
+          if-no-files-found: ignore
+          path: .build/simulator-tests/run.*/*.log

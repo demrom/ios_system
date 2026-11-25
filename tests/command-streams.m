@@ -9,7 +9,7 @@ static void timedOut(int signal) { _Exit(124); }
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if (argc != 3 && argc != 4) return 64;
+        if (argc < 3 || argc > 5) return 64;
         signal(SIGALRM, timedOut);
         alarm(10);
         initializeEnvironment();
@@ -36,7 +36,15 @@ int main(int argc, char **argv) {
         rewind(output);
         char actual[256] = {0};
         size_t count = fread(actual, 1, sizeof(actual) - 1, output);
-        BOOL passed = (argc == 4 ? status == atoi(argv[3]) : status == 0) && count == strlen(argv[2]) && !strcmp(actual, argv[2]);
+        BOOL passed = (argc >= 4 ? status == atoi(argv[3]) : status == 0) && count == strlen(argv[2]) && !strcmp(actual, argv[2]);
+        if (argc == 5) {
+            fflush(error);
+            rewind(error);
+            char diagnostic[1024] = {0};
+            fread(diagnostic, 1, sizeof(diagnostic) - 1, error);
+            dprintf(STDERR_FILENO, "captured stderr: %s", diagnostic);
+            passed = passed && strstr(diagnostic, argv[4]) != NULL;
+        }
         ashell_unregister_owned_streams(&registration);
         ios_setStreams(stdin, stdout, stderr);
         if (fclose(input) || fclose(output) || fclose(error)) return 1;
