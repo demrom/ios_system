@@ -11,6 +11,9 @@
 
 #define THREADS 8
 #define ROUNDS 400
+#ifndef CONCURRENT_FORK_WATCHDOG_SECONDS
+#define CONCURRENT_FORK_WATCHDOG_SECONDS 120
+#endif
 
 int tick_main(int argc, char **argv) {
     return 0;
@@ -36,7 +39,7 @@ static void timedOut(int signal) {
 int main(int argc, char **argv) {
     @autoreleasepool {
         signal(SIGALRM, timedOut);
-        alarm(120);
+        alarm(CONCURRENT_FORK_WATCHDOG_SECONDS);
         initializeEnvironment();
         ios_switchSession("concurrent-fork-probe");
         ios_setStreams(stdin, stdout, stderr);
