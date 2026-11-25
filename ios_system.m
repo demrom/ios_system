@@ -323,8 +323,8 @@ int ios_getWindowSize(int *columns, int *rows, const void* sessionId) {
     id sessionKey = @((NSUInteger)sessionId);
     sessionParameters* session = (sessionParameters*)[[sessionList objectForKey: sessionKey] pointerValue];
     if (session == NULL) return ENOENT;
-    *columns = atoi(session->columns);
-    *rows = atoi(session->lines);
+    *columns = 80;
+    *rows = 24;
     return 0;
 }
 
@@ -3140,23 +3140,22 @@ void ios_switchSession(const void* sessionId) {
         sessionList = [NSMutableDictionary new];
         if (currentSession != NULL) [sessionList setObject: [NSValue valueWithPointer:currentSession] forKey: sessionKey];
     }
-    // The UI creates sessionList before concurrent command sessions.
-    @synchronized(sessionList) {
-        currentSession = (sessionParameters*)[[sessionList objectForKey: sessionKey] pointerValue];
+    currentSession = (sessionParameters*)[[sessionList objectForKey: sessionKey] pointerValue];
 
-        if (currentSession == NULL) {
-            sessionParameters* newSession =  malloc(sizeof(sessionParameters));
-            initSessionParameters(newSession);
-            [sessionList setObject: [NSValue valueWithPointer:newSession] forKey: sessionKey];
-            currentSession = newSession;
-        } else {
-            NSString* currentSessionDir = [NSString stringWithCString:currentSession->currentDir encoding:NSUTF8StringEncoding];
-            if (![currentSessionDir isEqualToString:[NSFileManager.defaultManager currentDirectoryPath]]) {
-                [NSFileManager.defaultManager changeCurrentDirectoryPath:currentSessionDir];
-            }
-            // Selecting a live session preserves its caller-installed streams.
-            // New sessions receive process defaults in initSessionParameters.
+    if (currentSession == NULL) {
+        sessionParameters* newSession =  malloc(sizeof(sessionParameters));
+        initSessionParameters(newSession);
+        [sessionList setObject: [NSValue valueWithPointer:newSession] forKey: sessionKey];
+        currentSession = newSession;
+    } else {
+        NSString* currentSessionDir = [NSString stringWithCString:currentSession->currentDir encoding:NSUTF8StringEncoding];
+        if (![currentSessionDir isEqualToString:[NSFileManager.defaultManager currentDirectoryPath]]) {
+            [NSFileManager.defaultManager changeCurrentDirectoryPath:currentSessionDir];
         }
+        // Da fuck???? Yeah, that would hurt. Why is it there?
+        currentSession->stdin = stdin;
+        currentSession->stdout = stdout;
+        currentSession->stderr = stderr;
     }
 }
 
@@ -3175,9 +3174,7 @@ void ios_closeSession(const void* sessionId) {
     // delete information associated with current session:
     if (sessionList == nil) return;
     id sessionKey = @((NSUInteger)sessionId);
-    @synchronized(sessionList) {
-        [sessionList removeObjectForKey: sessionKey];
-    }
+    [sessionList removeObjectForKey: sessionKey];
     currentSession = NULL;
 }
 
@@ -3851,7 +3848,6 @@ int ios_system(const char* inputCmd) {
         ios_startInteractive();
     }
     // NSLog(@"command after alias expansion= %s\n", command);
-    maxPointer = command + strlen(command);
     // Search for input, output and error redirection
     // They can be in any order, although the usual are:
     // command < input > output 2> error, command < input > output 2>&1 or command < input >& output

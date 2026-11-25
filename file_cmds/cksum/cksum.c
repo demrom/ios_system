@@ -137,8 +137,7 @@ chksum_main(int argc, char **argv)
 			rval = 1;
 		} else
 			pfncn(fn, val, len);
-		if (fn != NULL)
-			(void)close(fd);
+		(void)close(fd);
 	} while (*argv);
 	exit(rval);
 }
