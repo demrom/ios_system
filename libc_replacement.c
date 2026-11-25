@@ -707,6 +707,10 @@ pid_t vfork(void) { return ios_nextAvailablePid(); }
 
 
 
+static void unlockThreadCompletion(void *mutex) {
+    pthread_mutex_unlock(mutex);
+}
+
 // simple replacement of waitpid for swift programs
 // We use "optnone" to prevent optimization, otherwise the while loops never end.
 __attribute__ ((optnone)) void ios_waitpid(pid_t pid) {
@@ -727,10 +731,13 @@ __attribute__ ((optnone)) void ios_waitpid(pid_t pid) {
     // ios_system detaches command threads, so pthread_join cannot wait for them.
     // Include the allocated-but-not-started (-1) state and recheck under the
     // notification mutex to avoid losing an exit between the check and wait.
+    // If a caller is cancelled, pthread_cond_wait reacquires the mutex before
+    // unwinding. Release it before command cleanup needs to notify other waiters.
     pthread_mutex_lock(&thread_completion_mutex);
+    pthread_cleanup_push(unlockThreadCompletion, &thread_completion_mutex);
     while (atomic_load(&thread_ids[pid]) != 0)
         pthread_cond_wait(&thread_completed, &thread_completion_mutex);
-    pthread_mutex_unlock(&thread_completion_mutex);
+    pthread_cleanup_pop(1);
     // fprintf(stderr, "Returning from ios_waitpid for %d \n", pid);
     return;
 }
