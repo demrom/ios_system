@@ -21,6 +21,7 @@ jobs:
           persist-credentials: false
           submodules: true
       - name: Build the native runtime and Wasm3 interpreter for Simulator
+        id: runtime
         shell: bash
         run: |
           xcodebuild -version
@@ -32,10 +33,15 @@ jobs:
           done
       - name: Run native spawn, cancellation, and environment regressions
         run: bash tests/native-spawn-ci.sh .build/spawn-products/Build/Products/Release-iphonesimulator
+      - name: Check auxiliary thread reclamation with ThreadSanitizer
+        if: ${{ !cancelled() && steps.runtime.outcome == 'success' }}
+        run: bash tests/native-spawn-tsan.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: native-spawn-logs
           include-hidden-files: true
-          path: .build/native-spawn-ci/run.*/*.log
+          path: |
+            .build/native-spawn-ci/run.*/*.log
+            .build/native-spawn-ci/tsan.*/*.log
           if-no-files-found: ignore
