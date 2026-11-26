@@ -597,7 +597,7 @@ int ios_setenv_parent(const char* name, const char* value, int overwrite) {
     return ios_setenv_pid(name, value, overwrite, previousPid[ios_currentPid()]);
 }
 int ios_setenv(const char* name, const char* value, int overwrite) {
-    return ios_setenv_pid(name, value, overwrite, ios_currentPid());
+    return ios_setenv_pid(name, value, overwrite, native_pid < 0 ? 0 : ios_currentPid());
 }
 int ios_putenv(char* string) {
     pthread_mutex_lock(&environment_mtx);

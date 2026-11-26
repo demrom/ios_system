@@ -596,7 +596,7 @@ static void *runCommandHelper(void *context) {
     currentCommand = command;
     currentSession = command->session;
     thread_stdin = command->stdin;
-    thread_stdout = command->stdout;
+    thread_stdout = command->stderr;
     thread_stderr = command->stderr;
     thread_context = command->context;
     ios_bindNativePid(helper->pid);
@@ -708,7 +708,7 @@ static int enterNativeCommand(functionParameters *parameters, const char *direct
         pthread_mutex_unlock(&nativeDirectoryMutex);
         return ECANCELED;
     }
-    if (directory) parameters->savedDirectory = open(".", O_RDONLY);
+    parameters->savedDirectory = open(".", O_RDONLY);
     int error = directory && parameters->savedDirectory < 0 ? errno : 0;
     if (!error && directory && changeDirectoryUnleased(directory)) error = errno;
     if (error) {
@@ -857,7 +857,6 @@ static NSString *leaseCommandImage(NSArray<NSString *> *images, functionParamete
     if (!leasedCommandImages) leasedCommandImages = [NSMutableSet set];
     for (NSString *image in images) {
         if (![image isKindOfClass:NSString.class]) { *error = EINVAL; break; }
-        if ([leasedCommandImages containsObject:image]) continue;
         parameters->leasedImage = strdup(image.UTF8String);
         if (!parameters->leasedImage) { *error = ENOMEM; break; }
         [leasedCommandImages addObject:image];
@@ -4719,7 +4718,10 @@ static int dispatchCommand(functionParameters *params, int argc, char **argv, in
             volatile pthread_t child = NULL;
             int error = createOwnedCommand(&child, params);
             if (launchError) *launchError = error;
-            if (!error) pthread_detach(child);
+            if (!error) {
+                currentSession->lastThreadId = child;
+                pthread_detach(child);
+            }
         } else if (!nativeDescendant && !params->asyncSpawn && currentSession->isMainThread) {
             params->storeRootThread = true;
             params->storeMainThread = true;
@@ -4747,7 +4749,6 @@ static int dispatchCommand(functionParameters *params, int argc, char **argv, in
                 // Wait for this process to finish:
 					if (joinMainThread && !params->asyncSpawn && (_tid != NULL)) {
 						pthread_join(_tid, NULL);
-                        ios_waitpid(0);
 						currentSession->lastThreadId = 0;
 						currentSession->current_command_root_thread = 0;
 					}
@@ -4760,7 +4761,6 @@ static int dispatchCommand(functionParameters *params, int argc, char **argv, in
                     // Wait for this process to finish:
                     if (joinMainThread && !params->asyncSpawn) {
                         pthread_join(_tid, NULL);
-                        ios_waitpid(0);
                         currentSession->lastThreadId = 0;
                         currentSession->current_command_root_thread = 0;
                     } else {
