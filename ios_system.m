@@ -706,7 +706,7 @@ static int enterNativeCommand(functionParameters *parameters, const char *direct
     pthread_mutex_lock(&nativeDirectoryMutex);
     if (currentCommand && (currentCommand->nativeCancelled || currentCommand->nativeStopping)) {
         pthread_mutex_unlock(&nativeDirectoryMutex);
-        return ECANCELED;
+        return EBUSY;
     }
     if (directory) parameters->savedDirectory = open(".", O_RDONLY);
     int error = directory && parameters->savedDirectory < 0 ? errno : 0;
@@ -787,14 +787,17 @@ static void waitNativeChildren(functionParameters *parameters) {
             FILE *outputs[] = {parameters->stdout, parameters->stderr};
             unsigned masks[] = {IOS_SPAWN_CANCEL_OUTPUT, IOS_SPAWN_CANCEL_ERROR};
             for (int i = 0; i < 2; i++) {
-                if (!(parameters->cancelStreams & masks[i]) || ftrylockfile(outputs[i])) continue;
+                if (!(parameters->cancelStreams & masks[i])) continue;
+                if (ftrylockfile(outputs[i])) {
+                    ios_storePidStatus(parameters->nativePid, 126);
+                    continue;
+                }
                 int fd = fileno(outputs[i]);
                 int flags = fcntl(fd, F_GETFL);
                 bool failed = flags < 0;
                 // These channels belong to this child; never wait on an abandoned reader.
                 if (!failed && !(flags & O_NONBLOCK)) failed = fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0;
                 if (!failed) {
-                    failed = fflush(outputs[i]) != 0;
                     if (!(flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags)) failed = true;
                 }
                 funlockfile(outputs[i]);
@@ -1111,7 +1114,7 @@ static void cleanup_function(void* parameters) {
     }
     pthread_mutex_lock(&nativeDirectoryMutex);
     p->nativeThread = NULL;
-    if (p->nativeCancelled && ownsCommandPid(p)) ios_storePidStatus(p->nativePid, 130);
+    if (p->nativeCancelled && ownsCommandPid(p)) ios_storePidStatus(p->nativePid, 128);
     pthread_mutex_unlock(&nativeDirectoryMutex);
     waitNativeChildren(p);
     pthread_mutex_lock(&ownedStreamsMutex);
@@ -1888,11 +1891,11 @@ static void* run_function(void* parameters) {
         if (p->nativeTracked) p->nativeThread = pthread_self();
         cancelled |= p->nativeCancelled;
         pthread_mutex_unlock(&nativeDirectoryMutex);
-        int retval = 130;
+        int retval = 128;
         if (!cancelled && !(p->workerEligible && runInWorker(p, &retval, NULL)))
             retval = p->function(p->argc, p->argv);
         pthread_mutex_lock(&nativeDirectoryMutex);
-        if (p->nativeCancelled) retval = 130;
+        if (p->nativeCancelled) retval = 128;
         p->normalReturn = !cancelled && !p->nativeCancelled;
         pthread_mutex_unlock(&nativeDirectoryMutex);
         if (ownsCommandPid(p)) {
