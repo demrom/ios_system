@@ -2,6 +2,8 @@
 
 Install jq and an iOS Simulator runtime that supports iPhone 17 (iOS 26 on Intel). Run `swift run --force-resolved-versions --package-path xcfs build ios_system,files,text --ios-only` and then `bash tests/simulator.sh .build .build/simulator-tests` from the repository root. The script compiles the existing consumers for the host's Simulator architecture, creates a disposable iPhone 17 Simulator, and records each command's output and exit status. Worker-broker and sanitizer fixtures retain their separate setup below.
 
+Pass the matching Simulator `rg.framework` as a third argument to include the native pipeline matrix. The hosted job verifies the same public ripgrep port archive used by the app; change that temporary artifact pin to a verified release when available. The matrix checks both joined and non-joined dispatch with real `head`, `cat`, `grep`, `rg`, `less` and `more`. It checks exact short input, statuses 0/1/2, early close and three-stage completion with 10,000 lines, pager interruption, and a following command. A stuck command produces the fixture's 10-second watchdog receipt.
+
 # Session window size
 
 `window-size.m` calls the public session APIs against the real ios_system framework. It checks independent sessions, reading from a thread without session TLS, resize, closed and unknown sessions, invalid arguments and unchanged outputs on errors.
