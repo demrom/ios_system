@@ -832,7 +832,7 @@ static void leaveNativeCommand(functionParameters *parameters) {
     if (!parameters->nativeTracked) return;
     pthread_mutex_lock(&nativeDirectoryMutex);
     if (parameters->savedDirectory >= 0) {
-        if (fchdir(parameters->savedDirectory) || !getcwd(parameters->session->currentDir, MAXPATHLEN)) {
+        if (!getcwd(parameters->session->currentDir, MAXPATHLEN)) {
             ios_storePidStatus(parameters->nativePid, 126);
             if (!parameters->nativeLaunch) parameters->session->global_errno = 126;
             NSLog(@"Cannot restore command directory: %s", strerror(errno));
@@ -4836,12 +4836,19 @@ int ios_spawn(pid_t *pid, const char *path, const ios_spawn_options *options,
             return ENOMEM;
         }
     }
+    for (int i = 1; i < argc; i++) {
+        if (copy[i][0]) continue;
+        free(copy[i]);
+        memmove(copy + i, copy + i + 1, (argc - i) * sizeof(*copy));
+        argc--;
+        i--;
+    }
     params->stdin = thread_stdin;
     params->stdout = thread_stdout;
     params->stderr = thread_stderr;
     params->nativeBorrowed = options == NULL;
     if (options) {
-        int descriptors[3] = {options->input, options->output, options->error};
+        int descriptors[3] = {options->input, options->output, options->output};
         FILE **streams[3] = {&params->stdin, &params->stdout, &params->stderr};
         for (int i = 0; i < 3; i++) {
             int descriptor = dup(descriptors[i]);
@@ -4894,7 +4901,6 @@ int ios_spawn(pid_t *pid, const char *path, const ios_spawn_options *options,
     pthread_mutex_lock(&nativeDirectoryMutex);
     params->nativePid = *pid;
     pthread_mutex_unlock(&nativeDirectoryMutex);
-    if (envp) storeEnvironment((char **)envp);
     int error = 0;
     dispatchCommand(params, argc, copy, &error);
     ios_bindNativePid(binding);
