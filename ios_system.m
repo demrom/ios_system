@@ -809,6 +809,7 @@ static void waitNativeChildren(functionParameters *parameters) {
     cancelCommandHelpers(parameters);
     for (functionParameters *command = nativeCommands; command; command = command->nativeNext) {
         if (command == parameters || !commandContains(parameters, command)) continue;
+        if (parameters->nativeLaunch && !command->nativeLaunch) continue;
         command->nativeCancelled = true;
         cancelCommandHelpers(command);
         shutdownNativeStreams(command);
@@ -823,7 +824,7 @@ static void waitNativeChildren(functionParameters *parameters) {
     }
     pthread_mutex_unlock(&nativeDirectoryMutex);
     extern void ios_reapNativeChildren(pid_t parent);
-    if (parameters->commandStarted && parameters->ownerPid > 0 && ownsCommandPid(parameters))
+    if (!parameters->nativeLaunch && parameters->commandStarted && parameters->ownerPid > 0 && ownsCommandPid(parameters))
         ios_reapNativeChildren(parameters->ownerPid);
 }
 
@@ -1046,11 +1047,11 @@ static void failCommandLaunch(functionParameters *parameters, int error) {
 static int createOwnedCommand(volatile pthread_t *thread, functionParameters *parameters) {
     parameters->ownerPid = currentCommand ? currentCommand->ownerPid : 0;
     parameters->dispatchPid = ios_currentPid();
-    if (!parameters->nativeTracked && currentCommand && currentCommand->nativeTracked) {
+    if (!parameters->nativeTracked && currentCommand && (currentCommand->nativeTracked || !joinMainThread)) {
         pthread_mutex_lock(&nativeDirectoryMutex);
         parameters->nativeParent = currentCommand;
         parameters->nativeTracked = true;
-        parameters->nativeCancelled = currentCommand->nativeCancelled || currentCommand->nativeStopping;
+        parameters->nativeCancelled = currentCommand->nativeCancelled;
         parameters->savedDirectory = -1;
         parameters->nativeNext = nativeCommands;
         nativeCommands = parameters;
@@ -2334,7 +2335,9 @@ void __cd_to_dir(NSString *newDir, NSFileManager *fileManager) {
   BOOL isDir;
   // Check for permission and existence:
   if (![fileManager fileExistsAtPath:newDir isDirectory:&isDir]) {
+    pthread_mutex_lock(&nativeDirectoryMutex);
     fprintf(thread_stderr, "cd: %s: no such file or directory\n", [newDir UTF8String]);
+    pthread_mutex_unlock(&nativeDirectoryMutex);
     return;
   }
   if (!isDir) {
@@ -4908,14 +4911,13 @@ static int dispatchShellCommand(const char *inputCmd);
 int ios_system(const char *inputCmd) {
     extern pid_t ios_takeNativeDispatchParent(void);
     extern int ios_takeLegacyDispatchCancellation(void);
-    pid_t caller = ios_takeNativeDispatchParent();
+    ios_takeNativeDispatchParent();
     pid_t legacyCaller = ios_takeLegacyDispatchParent();
     int forkCancellation = ios_takeLegacyDispatchCancellation();
     int cancellation;
     // Preserve the caller's cancellation state across legacy dispatch.
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
     int result = dispatchShellCommand(inputCmd);
-    if (caller >= 0) ios_bindNativePid(caller);
     if (legacyCaller >= 0) ios_bindCommandPid(legacyCaller);
     ios_takeLegacyDispatchCancellation();
     pthread_setcancelstate(forkCancellation >= 0 ? forkCancellation : cancellation, NULL);
@@ -5290,7 +5292,7 @@ static int dispatchShellCommand(const char* inputCmd) {
             if (newStream) params->stdin = newStream;
         }
         if (params->stdin == NULL) params->stdin = thread_stdin;
-        if (outputFileName) {
+        if (outputFileName && !(currentCommand && currentCommand->nativeLaunch)) {
             if (appendToFileName) {
                 newStream = fopen(ios_expandFilename(outputFileName), "a"); // append
             } else {
