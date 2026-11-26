@@ -3,6 +3,7 @@
 set -euo pipefail
 products=$(cd "${1:?Pass the xcframework build directory}" && pwd)
 logs=${2:?Pass a directory for the test logs}
+rg_framework=${3:-}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mkdir -p "$logs"
 work=$(mktemp -d "$logs/run.XXXXXX")
@@ -13,6 +14,10 @@ for name in ios_system files text; do
     cp -R "$products/$name/$name.xcframework/$slice/$name.framework" "$work/Frameworks/"
     codesign --force --sign - "$work/Frameworks/$name.framework"
 done
+if [[ -n $rg_framework ]]; then
+    cp -R "$rg_framework" "$work/Frameworks/rg.framework"
+    codesign --force --sign - "$work/Frameworks/rg.framework"
+fi
 
 arch=$(uname -m)
 target="$arch-apple-ios16.0-simulator"
@@ -34,6 +39,7 @@ for name in window-size signal-handlers cwd-order session-streams native-tty own
     direct-cancellation alias-redirection less-capture; do
     compile "$name"
 done
+if [[ -n $rg_framework ]]; then compile native-pipeline; fi
 
 mkdir "$work/Frameworks/SignalHandler.framework"
 signal_handler="$work/Frameworks/SignalHandler.framework/SignalHandler"
@@ -117,4 +123,12 @@ printf 'fixture\n' > "$input"
 quoted=${input//\'/\'\\\'\'}
 SIMCTL_CHILD_LC_ALL=C run gzip-open-error command-streams "gzip '$quoted'" '' 1 'File name too long'
 if ! printf 'fixture\n' | cmp - "$input"; then failed=1; fi
+if [[ -n $rg_framework ]]; then
+    status=0
+    /usr/bin/time -p bash "$root/tests/native-pipeline.sh" "$device" "$work/native-pipeline/native-pipeline" \
+        > "$work/native-pipeline.log" 2>&1 || status=$?
+    printf 'exit=%s\n' "$status" >> "$work/native-pipeline.log"
+    grep -E '^PIPELINE|^real ' "$work/native-pipeline.log" || true
+    if [[ $status != 0 ]]; then failed=1; fi
+fi
 exit "$failed"

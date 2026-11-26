@@ -22,17 +22,31 @@ jobs:
           persist-credentials: false
       - name: Build the runtime and command frameworks
         run: |
-          xcodebuild -version
+          xcodebuild -version | grep -Fx 'Xcode 26.6'
           swift run --force-resolved-versions --package-path xcfs build ios_system,files,text --ios-only
       - name: Run native runtime and command regressions
-        run: bash tests/simulator.sh .build .build/simulator-tests
+        shell: bash
+        run: |
+          rg_cache="$RUNNER_TEMP/native-rg"
+          mkdir -p "$rg_cache"
+          # Public ripgrep port, exact a-Shell producer 39996782368 at 0b0c20bb8d64.
+          curl -fsSLo "$rg_cache/artifact.zip" https://nightly.link/demrom/a-shell/actions/artifacts/12521225640.zip
+          printf '%s  %s\n' 63ec9a3b07afd7df114d3e4873078c69c2575b29628fca6c9f8fca23c32a7395 "$rg_cache/artifact.zip" | shasum -a 256 -c -
+          unzip -p "$rg_cache/artifact.zip" rg.xcframework.zip > "$rg_cache/rg.xcframework.zip"
+          slice=ios-arm64_x86_64-simulator
+          unzip -q "$rg_cache/rg.xcframework.zip" -d "$rg_cache" "rg.xcframework/$slice/*"
+          framework="$rg_cache/rg.xcframework/$slice/rg.framework"
+          xcrun lipo "$framework/rg" -verify_arch x86_64
+          bash tests/simulator.sh .build .build/simulator-tests "$framework"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: ios-system-simulator-logs
           include-hidden-files: true
           if-no-files-found: ignore
-          path: .build/simulator-tests/run.*/*.log
+          path: |
+            .build/simulator-tests/run.*/*.log
+            .build/simulator-tests/run.*/native-pipeline/*.err
   thread-sanitizer:
     runs-on: macos-26-intel
     timeout-minutes: 20
