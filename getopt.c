@@ -64,9 +64,9 @@ __thread int    __db_getopt_reset;    /* global reset for VxWorks. */
 #define optreset ios_optreset
 #define optarg ios_optarg
 __thread int    opterr = 1,        /* if error message should be printed */
-optind = 1,        /* index into parent argv vector */
 optopt,            /* character checked for validity */
 optreset;        /* reset getopt */
+int optind = 1;   /* index into parent argv vector */
 __thread char    *optarg;        /* argument associated with option */
 
 // Frameworks built before this change import getopt, getopt_long, optind and optarg from ios_system and read
