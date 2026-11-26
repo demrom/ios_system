@@ -726,7 +726,10 @@ static int enterNativeCommand(functionParameters *parameters, const char *direct
 }
 
 int ios_spawn_pipe(int descriptors[2]) {
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors)) return -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors)) {
+        if (errno == EMFILE) errno = EIO;
+        return -1;
+    }
     int noSignal = 1;
     if (setsockopt(descriptors[0], SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal)) ||
         setsockopt(descriptors[1], SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal))) {
@@ -1930,8 +1933,8 @@ void initializeEnvironment(void) {
     struct rlimit limitFilesOpen;
     if (getrlimit(RLIMIT_NOFILE, &limitFilesOpen) == 0) {
         rlim_t bound = limitFilesOpen.rlim_max < OPEN_MAX ? limitFilesOpen.rlim_max : OPEN_MAX;
-        if (limitFilesOpen.rlim_cur < bound) {
-            limitFilesOpen.rlim_cur = bound;
+        if (limitFilesOpen.rlim_cur != bound / 2) {
+            limitFilesOpen.rlim_cur = bound / 2;
             if (setrlimit(RLIMIT_NOFILE, &limitFilesOpen) != 0)
                 NSLog(@"Cannot raise file descriptor limit: %s", strerror(errno));
         }
@@ -2605,7 +2608,7 @@ FILE* ios_popen(const char* inputCmd, const char* type) {
     // skip past all spaces
     while ((command[0] == ' ') && strlen(command) > 0) command++;
     if (pipe(fd) < 0) {
-        int error = errno;
+        int error = errno == EMFILE ? EIO : errno;
         if (currentSession) currentSession->global_errno = error;
         fprintf(thread_stderr ? thread_stderr : stderr, "pipe: %s\n", strerror(error));
         errno = error;
@@ -4809,7 +4812,7 @@ static int dispatchCommand(functionParameters *params, int argc, char **argv, in
         // TODO: this should also raise an exception, for python scripts
     } // if (function)
     if (!nativeLaunch) {
-        // The caller retains its input stream, including any active reader.
+        fflush(thread_stdin);
         if (thread_stdout != thread_stdin) fflush(thread_stdout);
         if (thread_stderr != thread_stdin) fflush(thread_stderr);
     }
@@ -4944,6 +4947,11 @@ static int dispatchShellCommand(const char* inputCmd) {
     if (currentSession == NULL) {
         currentSession = malloc(sizeof(sessionParameters));
         initSessionParameters(currentSession);
+    }
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur > OPEN_MAX) {
+        limit.rlim_cur = OPEN_MAX;
+        setrlimit(RLIMIT_NOFILE, &limit);
     }
     currentSession->global_errno = 0;
     NSLog(@"Starting command: %s currentSession->isMainThread: %d", inputCmd, currentSession->isMainThread);
