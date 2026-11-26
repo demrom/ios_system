@@ -730,6 +730,31 @@ static void cleanup_function(void* parameters) {
         }
         currentSession->activePager = FALSE;
     }
+    if (p->commandStarted && (!joinMainThread) && p->isPipeOut
+        && (strcmp(commandName, "ssh") != 0)
+        && (! ((strcmp(commandName, "dash") == 0) && (p->argc >= 2) && (strcmp(p->argv_ref[1], "-c") == 0)))) {
+        if (currentSession->current_command_root_thread != 0) {
+            if (currentSession->current_command_root_thread != current_thread) {
+                NSLog(@"Thread %x is waiting for root_thread of currentSession: %x \n", current_thread, currentSession->current_command_root_thread);
+                while ((currentSession->current_command_root_thread != 0) && (currentSession->current_command_root_thread != current_thread)) {
+                    if (ownedCommandCancelled(p)) break;
+                    fflush(currentSession->stdout);
+                    fflush(currentSession->stderr);
+                    struct timespec deadline;
+                    clock_gettime(CLOCK_REALTIME, &deadline);
+                    deadline.tv_nsec += 50 * 1000 * 1000;
+                    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+                    pthread_mutex_lock(&rootThreadMutex);
+                    if (currentSession->current_command_root_thread != 0) pthread_cond_timedwait(&rootThreadCleared, &rootThreadMutex, &deadline);
+                    pthread_mutex_unlock(&rootThreadMutex);
+                }
+                NSLog(@"Thread %x is done waiting for root_thread of currentSession: %x \n", current_thread, currentSession->current_command_root_thread);
+            } else {
+                NSLog(@"Terminating root_thread of currentSession %x \n", current_thread);
+                clearRootThread(currentSession);
+            }
+        }
+    }
     if (p->commandStarted) {
         fcntl(fileno(thread_stdin), F_SETNOSIGPIPE);
         fcntl(fileno(thread_stdout), F_SETNOSIGPIPE);
@@ -794,36 +819,6 @@ static void cleanup_function(void* parameters) {
     }
     // Upstream commands may still need ios_fork/chdir while we wait.
     ios_cleanupEnd();
-    // Close our streams before waiting: an early reader must unblock upstream writers.
-    // If the command was started as a pipe, we wait for the first command to finish sending data
-    // There is an exception for ssh, which can be started by scp or sftp. They will wait for it.
-    // Another exception for "dash -c": one command is reading its output
-    if (p->commandStarted && (!joinMainThread) && p->isPipeOut
-        && (strcmp(commandName, "ssh") != 0) // not ssh
-        && (! ((strcmp(commandName, "dash") == 0) && (p->argc >= 2) && (strcmp(p->argv_ref[1], "-c") == 0)))) { // not "dash -c something"
-        if (currentSession->current_command_root_thread != 0) {
-            if (currentSession->current_command_root_thread != current_thread) {
-                NSLog(@"Thread %x is waiting for root_thread of currentSession: %x \n", current_thread, currentSession->current_command_root_thread);
-                while ((currentSession->current_command_root_thread != 0) && (currentSession->current_command_root_thread != current_thread)) {
-                    if (ownedCommandCancelled(p)) break;
-                    fflush(currentSession->stdout);
-                    fflush(currentSession->stderr);
-                    // Sleep until the root thread ends; the timeout is for cancellation, which has no condition to signal.
-                    struct timespec deadline;
-                    clock_gettime(CLOCK_REALTIME, &deadline);
-                    deadline.tv_nsec += 50 * 1000 * 1000;
-                    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
-                    pthread_mutex_lock(&rootThreadMutex);
-                    if (currentSession->current_command_root_thread != 0) pthread_cond_timedwait(&rootThreadCleared, &rootThreadMutex, &deadline);
-                    pthread_mutex_unlock(&rootThreadMutex);
-                }
-                NSLog(@"Thread %x is done waiting for root_thread of currentSession: %x \n", current_thread, currentSession->current_command_root_thread);
-            } else {
-                NSLog(@"Terminating root_thread of currentSession %x \n", current_thread);
-                clearRootThread(currentSession);
-            }
-        }
-    }
     ios_cleanupBegin();
     // Specific to run multiple python3 interpreters:
     NSString* commandNameString = [NSString stringWithCString: commandName encoding:NSUTF8StringEncoding];
