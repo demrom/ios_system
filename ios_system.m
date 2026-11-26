@@ -530,14 +530,7 @@ int ashell_register_owned_streams(FILE *input, FILE *output, FILE *error, void *
 }
 
 static bool callerOwnsStream(FILE *stream) {
-    if (!stream) return false;
-    bool found = false;
-    pthread_mutex_lock(&ownedStreamsMutex);
-    for (ownedStreams *entry = registeredStreams; entry && !found; entry = entry->next)
-        for (int i = 0; i < 3; i++)
-            if (stream == entry->streams[i]) found = true;
-    pthread_mutex_unlock(&ownedStreamsMutex);
-    return found;
+    return false;
 }
 
 // Keep a command input pipe alive without replacing its tree cancellation owner.
@@ -808,14 +801,6 @@ static void cleanup_function(void* parameters) {
                     if (ownedCommandCancelled(p)) break;
                     fflush(currentSession->stdout);
                     fflush(currentSession->stderr);
-                    // Sleep until the root thread ends; the timeout is for cancellation, which has no condition to signal.
-                    struct timespec deadline;
-                    clock_gettime(CLOCK_REALTIME, &deadline);
-                    deadline.tv_nsec += 50 * 1000 * 1000;
-                    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
-                    pthread_mutex_lock(&rootThreadMutex);
-                    if (currentSession->current_command_root_thread != 0) pthread_cond_timedwait(&rootThreadCleared, &rootThreadMutex, &deadline);
-                    pthread_mutex_unlock(&rootThreadMutex);
                 }
                 NSLog(@"Thread %x is done waiting for root_thread of currentSession: %x \n", current_thread, currentSession->current_command_root_thread);
             } else {
@@ -3859,7 +3844,7 @@ int ios_system(const char* inputCmd) {
     // Search for input file "< " and output file " >"
     if (!inputFileMarker) inputFileMarker = command;
     outputFileMarker = inputFileMarker;
-    functionParameters *params = (functionParameters*) calloc(1, sizeof(functionParameters));
+    functionParameters *params = (functionParameters*) malloc(sizeof(functionParameters));
     if (params == NULL) {
         NSLog(@"Unable to allocate params in ios_system");
         return -1;
