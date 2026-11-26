@@ -13,15 +13,19 @@ int writer_main(int argc, char **argv) {
     sigaddset(&interrupts, SIGINT);
     pthread_sigmask(SIG_BLOCK, &interrupts, NULL);
     fcntl(fileno(thread_stdout), F_SETNOSIGPIPE, 1);
-    int count = argc > 1 ? atoi(argv[1]) : 10000;
-    for (int i = 0; i < count; i++) {
+    bool untilClosed = argc > 1 && strcmp(argv[1], "until-closed") == 0;
+    unsigned int count = argc > 1 ? (unsigned int)atoi(argv[1]) : 10000;
+    for (unsigned int i = 0; untilClosed || i < count; i++) {
         sigpending(&pending);
         if (sigismember(&pending, SIGINT)) {
-            fprintf(thread_stderr, "WRITER interrupted after %d lines\n", i);
+            fprintf(thread_stderr, "WRITER interrupted after %u lines\n", i);
+            return untilClosed ? 1 : 0;
+        }
+        if (fprintf(thread_stdout, "x %06u abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz\n", i) < 0) {
+            if (errno != EPIPE) return 1;
+            if (untilClosed) fprintf(thread_stderr, "WRITER downstream closed\n");
             return 0;
         }
-        if (fprintf(thread_stdout, "x %06d abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz\n", i) < 0)
-            return errno == EPIPE ? 0 : 1;
     }
     return fflush(thread_stdout) == 0 || errno == EPIPE ? 0 : 1;
 }

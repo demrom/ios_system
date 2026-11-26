@@ -37,6 +37,11 @@ check() {
 # shellcheck disable=SC2329
 lines() { [[ $(wc -l < "$1") -eq $2 ]]; }
 # shellcheck disable=SC2329
+closed_output() {
+    lines "$work/closed-$1.file" 10 &&
+        grep -Fxq 'WRITER downstream closed' "$work/closed-$1.err"
+}
+# shellcheck disable=SC2329
 pager_output() {
     grep -Eq '^WRITER interrupted after [0-9]+ lines$' "$work/$1.err" &&
         grep -Fxq 'FOLLOWUP returned=0 status=0' "$work/$1.err" &&
@@ -53,6 +58,7 @@ for join in 0 1; do
     check "unredirected-$join" 0 'writer 10000 | head' lines "$work/unredirected-$join.out" 10
     check "early-$join" 0 "writer 10000 | head > '$work/early-$join.file'" lines "$work/early-$join.file" 10
     check "three-stage-$join" 0 "writer 10000 | cat | head > '$work/three-stage-$join.file'" lines "$work/three-stage-$join.file" 10
+    check "closed-$join" 0 "writer until-closed | cat | head > '$work/closed-$join.file'" closed_output "$join"
     for pager in less more; do
         check "$pager-$join" 0 "writer 10000 | cat | $pager" pager_output "$pager-$join"
     done
