@@ -89,6 +89,7 @@ run() {
         failed=1
     fi
 }
+run concurrent-fork-reservation concurrent-fork --reservation
 for name in window-size signal-handlers session-streams native-tty owned-streams input-lease wasm-stdin-close \
     wasm-command-order waitpid-idle cleanup-wait cleanup-cancel concurrent-fork concurrent-getopt getopt-legacy \
     main-thread-winch pid-admission child-wait-status less-capture; do

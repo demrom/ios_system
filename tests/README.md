@@ -174,7 +174,9 @@ Expected: exit 0 and `ios_waitpid: wall=1.5s cpu=0.0s PASS`. With the polling wa
 
 `concurrent-fork.m` starts eight threads that each run 400 short commands behind `ios_fork`, `ios_system` and `ios_waitpid`. A command that ends must not move `current_pid` under a thread that has just forked; if it does, the new command's slot stays at "not started" and its `ios_waitpid` never returns.
 
-Build and run it like `waitpid-idle.m` (`-F` the framework directory, `tests/concurrent-fork.m`, `xcrun simctl spawn`). Expected: exit 0 and `concurrent-fork: 8 threads x 400 commands PASS`. Without the compare-and-swap in `ios_restoreParentPid`: exit 124 and `FAIL, N of 8 threads finished`, bounded by a two-minute alarm that prints the stacks of all threads before it exits (`hang-dump.h`, via `sample`).
+Build and run it like `waitpid-idle.m` (`-F` the framework directory, `tests/concurrent-fork.m`, `xcrun simctl spawn`). Expected: exit 0 and `concurrent-fork: 8 threads x 400 commands PASS`. Without the compare-and-swap in `ios_restoreParentPid`, the stress run can hit the two-minute watchdog (`hang-dump.h` prints blocked thread stacks), or it can still pass if the overlap is missed.
+
+The `--reservation` invocation runs as a separate standalone case. Two real commands in independent sessions wait on semaphores; the older exits with status 17 while the newer is held. The newer PID must stay current and still be waitable, then finish with its own status 23. The historic unconditional parent restore fails the PID assertion without depending on scheduling. The sanitizer job retains the original 3,200-command invocation.
 
 # Concurrent getopt
 
