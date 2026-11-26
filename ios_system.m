@@ -312,10 +312,6 @@ void ios_setWindowSize(int width, int height, const void* sessionId) {
     if (resizedSession->lastThreadId != NULL) {
         pthread_kill(resizedSession->lastThreadId, SIGWINCH);
     }
-    pthread_t mainThread = resizedSession->mainThreadId; // one load: cleanup_function can clear it in between
-    if (mainThread != NULL) {
-        pthread_kill(mainThread, SIGWINCH);
-    }
 }
 
 int ios_getWindowSize(int *columns, int *rows, const void* sessionId) {
@@ -780,6 +776,10 @@ static void cleanup_function(void* parameters) {
         mustCloseStdin &= p->isPipeIn;
         if (currentSession != nil) {
             mustCloseStdin &= fileno(p->stdin) != fileno(currentSession->stdin);
+        }
+        if (strcmp(p->argv[0], "wasm") == 0) {
+            char filePath[MAXPATHLEN];
+            if (fcntl(fileno(p->stdin), F_GETPATH, filePath) < 0) mustCloseStdin = false;
         }
         // commands started by Python: Python will close stdin (Lua and Perl? not broken, AFAIK)
         // The current command is still counted until after the root-thread wait.
@@ -3184,12 +3184,6 @@ void ios_closeSession(const void* sessionId) {
 int ios_isatty(int fd) {
     // NSLog(@"Entering ios_isatty, fd= %d", fd);
     if (currentSession == NULL) return 0;
-    if (currentSession->nativeTTY) {
-        if (fd == STDIN_FILENO && thread_stdin) fd = fileno(thread_stdin);
-        else if (fd == STDOUT_FILENO && thread_stdout) fd = fileno(thread_stdout);
-        else if (fd == STDERR_FILENO && thread_stderr) fd = fileno(thread_stderr);
-        return isatty(fd);
-    }
     // Anything running inside "sh -c" is not a tty:
     if (currentSession->context == sh_session) return 0;
     // 2 possibilities: 0, 1, 2 (classical) or fileno(thread_stdout)

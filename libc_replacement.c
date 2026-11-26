@@ -217,8 +217,7 @@ int ios_pidStatus(pid_t pid) {
 }
 
 static int wait_status(pid_t pid) {
-    return pid > 0 && pid < IOS_MAX_THREADS ?
-        atomic_load(&command_status[pid]) : ios_getCommandStatus();
+    return ios_getCommandStatus();
 }
 
 static int numVariablesSet[IOS_MAX_THREADS];
@@ -250,15 +249,9 @@ void ios_cleanupEnd(void) {
 }
 
 void ios_cleanupWait(void) {
-    // pthread_cond_wait is a cancellation point and returns with cleanup_mutex held: a cancelled command would run
-    // cleanup_function, whose ios_cleanupBegin locks cleanup_mutex again and never returns. The spin it replaces
-    // was not a cancellation point; the cancel now arrives at the next one after the wait.
-    int cancellation;
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
     pthread_mutex_lock(&cleanup_mutex);
     while (cleanup_counter > 0) pthread_cond_wait(&cleanup_idle, &cleanup_mutex);
     pthread_mutex_unlock(&cleanup_mutex);
-    pthread_setcancelstate(cancellation, NULL);
 }
 
 
@@ -280,13 +273,6 @@ inline pthread_t ios_getThreadId(pid_t pid) {
 void newPreviousDirectory(void) {
     // Called when a command calls "cd". Actually changes the directory for that command.
     getwd(previousDirectory[current_pid]);
-}
-
-// Called with thread_completion_mutex held: is there a pid that no command uses?
-static int pidSlotIsFree(void) {
-    for (int p = 1; p < IOS_MAX_THREADS; p++)
-        if (atomic_load(&thread_ids[p]) == 0) return 1;
-    return 0;
 }
 
 // We do not recycle process ids too quickly to avoid collisions.
@@ -316,25 +302,7 @@ static inline const pid_t ios_nextAvailablePid(void) {
     // We've already started more than IOS_MAX_THREADS threads.
     if (!pid_overflow) current_pid = 0; // first time over the limit
     pid_overflow = 1;
-    int scanned = 0;
     while (1) {
-        if (++scanned > IOS_MAX_THREADS) {
-            // Every slot is taken: wait for a command to end instead of spinning. pid_mtx is released while
-            // waiting, because an ending command waits for it before it frees its slot.
-            current_pid = previousPidId;
-            pthread_mutex_unlock(&pid_mtx);
-            // pthread_cond_wait is a cancellation point and a cancelled thread would leave it holding
-            // thread_completion_mutex, which every ending command takes. Cancel arrives after the wait.
-            int cancellation;
-            pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
-            pthread_mutex_lock(&thread_completion_mutex);
-            while (!pidSlotIsFree()) pthread_cond_wait(&thread_completed, &thread_completion_mutex);
-            pthread_mutex_unlock(&thread_completion_mutex);
-            pthread_setcancelstate(cancellation, NULL);
-            pthread_mutex_lock(&pid_mtx);
-            currentEnvironment = environmentVariables(previousPidId); // ios_setenv may have reallocated it meanwhile
-            scanned = 0;
-        }
         current_pid = last_allocated_pid + 1;
         last_allocated_pid = current_pid;
         if (current_pid >= IOS_MAX_THREADS) {
