@@ -731,9 +731,9 @@ static void cleanup_function(void* parameters) {
         currentSession->activePager = FALSE;
     }
     if (p->commandStarted) {
-        fcntl(fileno(thread_stdin), F_SETNOSIGPIPE);
-        fcntl(fileno(thread_stdout), F_SETNOSIGPIPE);
-        fcntl(fileno(thread_stderr), F_SETNOSIGPIPE);
+        fcntl(fileno(thread_stdin), F_SETNOSIGPIPE, 1);
+        fcntl(fileno(thread_stdout), F_SETNOSIGPIPE, 1);
+        fcntl(fileno(thread_stderr), F_SETNOSIGPIPE, 1);
         fflush(thread_stdin);
         fflush(thread_stdout);
         fflush(thread_stderr);
@@ -2290,8 +2290,8 @@ FILE* ios_popen(const char* inputCmd, const char* type) {
     while ((command[0] == ' ') && strlen(command) > 0) command++;
     if (pipe(fd) < 0) { return NULL; } // Nothing we can do if pipe fails
     // F_SETNOSIGPIPE: don't cause a signal 13 if the pipe is already closed
-    fcntl(fd[0], F_SETNOSIGPIPE);
-    fcntl(fd[1], F_SETNOSIGPIPE);
+    fcntl(fd[0], F_SETNOSIGPIPE, 1);
+    fcntl(fd[1], F_SETNOSIGPIPE, 1);
     // NOTES: fd[0] is set up for reading, fd[1] is set up for writing
     // fpout = fdopen(fd[1], "w");
     // fpin = fdopen(fd[0], "r");

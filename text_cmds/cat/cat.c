@@ -51,10 +51,11 @@ __FBSDID("$FreeBSD: src/bin/cat/cat.c,v 1.32 2005/01/10 08:39:20 imp Exp $");
 #ifndef NO_UDOM_SUPPORT
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <errno.h>
 #endif
 
 #include <ctype.h>
+#include <errno.h>
+#include <stdbool.h>
 #include <err.h>
 #include <fcntl.h>
 #include <locale.h>
@@ -72,7 +73,7 @@ const __thread char *filename;
 static void usage(void);
 static void scanfiles(char *argv[], int cooked);
 static void cook_cat(FILE *);
-static void raw_cat(int);
+static bool raw_cat(int);
 
 #ifndef NO_UDOM_SUPPORT
 static int udom_open(const char *path, int flags);
@@ -167,9 +168,11 @@ scanfiles(char *argv[], int cooked)
 				fclose(fp);
 			}
 		} else {
-			raw_cat(fd);
+			bool writable = raw_cat(fd);
 			if (fd != fileno(thread_stdin))
 				close(fd);
+			if (!writable)
+				break;
 		}
 		if (path == NULL)
 			break;
@@ -239,40 +242,27 @@ cook_cat(FILE *fp)
     }
 }
 
-static void
+static bool
 raw_cat(int rfd)
 {
-	int off, wfd;
-	ssize_t nr, nw;
-	static __thread size_t bsize;
-	static __thread char *buf = NULL;
-	// struct stat sbuf;
+	char buf[1024];
+	ssize_t nr;
 
-	wfd = fileno(thread_stdout);
-	if (buf == NULL) {
-        // if (fstat(wfd, &sbuf))
-			// err(1, "%s", filename);
-        bsize = 1024; // MAX(sbuf.st_blksize, 1024);
-        if ((buf = malloc(bsize)) == NULL) {
-            err(1, "buffer");
-        }
+	while ((nr = read(rfd, buf, sizeof(buf))) > 0) {
+		if (fwrite(buf, 1, (size_t)nr, thread_stdout) != (size_t)nr) {
+			// Stop reading when head closes. Otherwise cat keeps its own producer alive.
+			if (errno != EPIPE) {
+				warn("stdout");
+				rval = 1;
+			}
+			return false;
+		}
 	}
-	while ((nr = read(rfd, buf, bsize)) > 0)
-        for (off = 0; nr; nr -= nw, off += nw) {
-            // We can't write to the fd of stdout, so we write to stdout
-            nw = 0; // number of bytes written
-            for (int i = 0; i < nr; i++) {
-                fputc(*(buf+off+nw), thread_stdout);
-                nw += 1;
-            }
-			// if ((nw = write(wfd, buf + off, (size_t)nr)) < 0) err(1, "stdout");
-        }
 	if (nr < 0) {
-        warn("%s", filename);
+		warn("%s", filename);
 		rval = 1;
 	}
-    free(buf);
-    buf = NULL;
+	return true;
 }
 
 #ifndef NO_UDOM_SUPPORT
