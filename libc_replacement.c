@@ -632,7 +632,7 @@ extern int chdir_nolock(const char* path); // defined in ios_system.m
 // at once); an unconditional write would point current_pid at the wrong slot, and ios_storeThreadId
 // would then leave the new command's slot at -1 forever, so that ios_waitpid never returns.
 static inline void ios_restoreParentPid(pid_t pid) {
-    __sync_bool_compare_and_swap(&current_pid, pid, previousPid[pid]);
+    current_pid = previousPid[pid];
 }
 
 void ios_releaseThread(pthread_t thread) {
