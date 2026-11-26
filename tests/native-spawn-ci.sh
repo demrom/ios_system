@@ -42,7 +42,7 @@ standalone=(arguments environment streams directory inherited-directory inherite
     unload-streams status-retention cancellation legacy-cancellation parent-exit legacy-pid session-thread fork-cancellation
     helper-context helper-cleanup images unforked-session restore-status helper-cooperative legacy-environment-return
     cd-backpressure worker-admission)
-others=(waitpid-cancel joined-pipeline borrowed-input descriptor-limits environment-snapshot)
+others=(waitpid-cancel joined-pipeline borrowed-input descriptor-limits environment-snapshot owned-command-snapshot)
 compile() {
     local name=$1
     "${cc[@]}" -fobjc-arc -Wall -Wextra -Wno-unused-parameter -framework ios_system -framework Foundation \
@@ -65,6 +65,7 @@ for name in ImageA ImageB; do build_framework "$name" spawn-image-command.c; don
 build_framework Unload spawn-unload-command.c
 plutil -insert image-job -json '["@rpath/ImageA.framework/ImageA","image_main","","no",["@rpath/ImageB.framework/ImageB"]]' "$work/commandDictionary.plist"
 plutil -insert unload-job -json '["@rpath/Unload.framework/Unload","unload_main","","no",[]]' "$work/commandDictionary.plist"
+plutil -insert state-fixture -json '["MAIN","term_state_fixture","","no"]' "$work/commandDictionary.plist"
 for name in spawn-cleanup-close-hook log-writev-hook; do
     "${cc[@]}" -dynamiclib -Wl,-undefined,dynamic_lookup "$root/tests/$name.c" -o "$work/$name.dylib"
     codesign --force --sign - "$work/$name.dylib"
@@ -90,7 +91,7 @@ run() {
     fi
 }
 for name in "${standalone[@]}"; do run "spawn-$name" "spawn-$name"; done
-for name in waitpid-cancel joined-pipeline borrowed-input spawn-stopping-parent spawn-nested-system; do run "$name" "$name"; done
+for name in waitpid-cancel joined-pipeline borrowed-input owned-command-snapshot spawn-stopping-parent spawn-nested-system; do run "$name" "$name"; done
 for mode in startup startup-maximum maximum pipeline spawn; do run "descriptor-limits-$mode" descriptor-limits "$mode"; done
 for mode in normal full contended; do run "spawn-buffered-$mode" spawn-buffered-return "$mode"; done
 run borrowed-input-unregistered borrowed-input unregistered
