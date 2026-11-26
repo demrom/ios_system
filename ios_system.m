@@ -879,7 +879,7 @@ static void cleanup_function(void* parameters) {
     if ((p->dlHandle != RTLD_SELF) && (p->dlHandle != RTLD_MAIN_ONLY)
         && (p->dlHandle != RTLD_DEFAULT) && (p->dlHandle != RTLD_NEXT)) {
         Dl_info commandImage;
-        if (!sharedImageIsRunning && dladdr(p->function, &commandImage)) {
+        if (dladdr(p->function, &commandImage)) {
             for (int number = 1; number < NSIG; number++) {
                 struct sigaction action;
                 Dl_info handlerImage;
@@ -3110,7 +3110,7 @@ int ios_interruptpid(pid_t pid) {
         } else {
             p->cancellationSignal = SIGINT;
         }
-        int error = pthread_cancel(thread);
+        int error = pthread_kill(thread, SIGINT);
         if (error) p->cancellationSignal = 0;
         pthread_mutex_unlock(&commandSignalMutex);
         return error;

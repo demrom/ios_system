@@ -63,11 +63,11 @@ __thread int    __db_getopt_reset;    /* global reset for VxWorks. */
 #define optopt ios_optopt
 #define optreset ios_optreset
 #define optarg ios_optarg
-__thread int    opterr = 1,        /* if error message should be printed */
+int    opterr = 1,        /* if error message should be printed */
 optind = 1,        /* index into parent argv vector */
 optopt,            /* character checked for validity */
 optreset;        /* reset getopt */
-__thread char    *optarg;        /* argument associated with option */
+char    *optarg;        /* argument associated with option */
 
 // Frameworks built before this change import getopt, getopt_long, optind and optarg from ios_system and read
 // the results from the shared variables. getopt and getopt_long below keep serving them from these.
@@ -190,7 +190,6 @@ static void legacy_leave(void) {
     ios_shared_opterr = ios_opterr;
     ios_shared_optopt = ios_optopt;
     ios_shared_optreset = ios_optreset;
-    ios_shared_optarg = ios_optarg;
 }
 
 #undef getopt

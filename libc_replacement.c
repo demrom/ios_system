@@ -42,7 +42,7 @@ int startedPreparingWebAssemblyCommand(void) {
 }
 
 int webAssemblyCommandOrder(void) {
-    return currentWebAssemblyCommandOrder;
+    return orderOfWebAssemblyCommands;
 }
 
 void finishedPreparingWebAssemblyCommand(void) {
