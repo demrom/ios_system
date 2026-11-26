@@ -178,9 +178,9 @@ Build and run it like `waitpid-idle.m` (`-F` the framework directory, `tests/con
 
 # Concurrent getopt
 
-`concurrent-getopt.m` runs two commands that parse options with `getopt` and print their first operand, from eight threads at once (300 rounds each, answers compared with the expected text). libc's `optind` and `optreset` are process-wide, so one command's parsing used to move another's and the second command skipped its operand (`(none)`).
+`concurrent-getopt.m` dispatches one real command that advances `optind` to 2 and pauses it while a second command parses a positional argument. The first command must still see 2 when it resumes. It then runs the original stress check: eight threads run 300 commands each, comparing every first operand to the expected text. With shared option state, one command can change another's `optind`.
 
-Build it like `concurrent-fork.m`, with `-I .` for `ios_error.h`, and put an empty `commandDictionary.plist` (`<dict/>`) or `Resources/commandDictionary.plist` next to the binary, or `replaceCommand` reports `command not found`. Expected: exit 0 and `concurrent-getopt: 8 threads x 300 commands PASS`. With the shared `optind`: exit 1 and `FAIL, N of 2400 commands gave a wrong answer`.
+Build it like `concurrent-fork.m`, with `-I .` for `ios_error.h`, and put an empty `commandDictionary.plist` (`<dict/>`) or `Resources/commandDictionary.plist` next to the binary, or `replaceCommand` reports `command not found`. Expected: exit 0, `GETOPT_OVERLAP first=2 after=2 sibling_ready=1 PASS`, and `concurrent-getopt: 8 threads x 300 commands PASS`. With shared `optind`, the ordered check reports `after=1` and exits 1 even if the stress workload happens to pass.
 
 `getopt-legacy.m` stands in for a framework built before this change: it does not include `ios_error.h` and reads `optind` and `optarg` after calling the exported `getopt` and `getopt_long`, and runs a `getopt_long` command three times through `ios_system` with no reset in between. Build it like `concurrent-getopt.m` and run it with `xcrun simctl spawn`. Expected: exit 0 and `getopt-legacy: PASS`. Without the shared reset in `run_function`: runs 2 and 3 of `legacyopt` print `FAIL`.
 # ThreadSanitizer

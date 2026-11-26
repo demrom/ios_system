@@ -5,6 +5,7 @@
 #import "ios_system.h"
 #include "hang-dump.h"
 #import "ios_error.h"
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -26,6 +27,45 @@ int tapb_main(int argc, char **argv) { return operand_main(argc, argv); }
 
 static atomic_int wrong, finished;
 static char directory[PATH_MAX];
+static dispatch_semaphore_t firstParsed, secondParsed;
+static atomic_bool firstPreserved, secondValid;
+
+int getopt_first_main(int argc, char **argv) {
+    int option = getopt(argc, argv, "a");
+    int before = optind;
+    dispatch_semaphore_signal(firstParsed);
+    bool ready = dispatch_semaphore_wait(secondParsed, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0;
+    int after = optind;
+    bool passed = ready && option == 'a' && argc == 3 && before == 2 && after == before && !strcmp(argv[after], "left");
+    atomic_store(&firstPreserved, passed);
+    dprintf(STDERR_FILENO, "GETOPT_OVERLAP first=%d after=%d sibling_ready=%d %s\n", before, after, ready, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+int getopt_second_main(int argc, char **argv) {
+    int option = getopt(argc, argv, "a");
+    bool passed = option == -1 && argc == 2 && optind == 1 && !strcmp(argv[optind], "right");
+    atomic_store(&secondValid, passed);
+    dispatch_semaphore_signal(secondParsed);
+    return passed ? 0 : 1;
+}
+
+static bool checkOrderedOverlap(void) {
+    firstParsed = dispatch_semaphore_create(0);
+    secondParsed = dispatch_semaphore_create(0);
+    pid_t first = ios_fork();
+    ios_system("getopt-first -a left");
+    if (dispatch_semaphore_wait(firstParsed, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
+        dprintf(STDERR_FILENO, "GETOPT_OVERLAP first did not parse its option\n");
+        return false;
+    }
+    // The first command has already advanced optind, but has not returned.
+    pid_t second = ios_fork();
+    ios_system("getopt-second right");
+    ios_waitpid(first);
+    ios_waitpid(second);
+    return atomic_load(&firstPreserved) && atomic_load(&secondValid);
+}
 
 static void check(const char *command, const char *output, const char *expected) {
     FILE *f = fopen(output, "r");
@@ -72,7 +112,10 @@ int main(int argc, char **argv) {
         ios_setStreams(stdin, stdout, stderr);
         replaceCommand(@"tapa", @"tapa_main", false);
         replaceCommand(@"tapb", @"tapb_main", false);
+        replaceCommand(@"getopt-first", @"getopt_first_main", false);
+        replaceCommand(@"getopt-second", @"getopt_second_main", false);
         joinMainThread = false;
+        bool isolated = checkOrderedOverlap();
         snprintf(directory, sizeof(directory), "%s/concurrent-getopt-%d", getenv("TMPDIR") ?: "/tmp", getpid());
         mkdir(directory, 0700);
         pthread_t threads[THREADS];
@@ -84,6 +127,6 @@ int main(int argc, char **argv) {
             return 1;
         }
         fprintf(stderr, "concurrent-getopt: %d threads x %d commands PASS\n", THREADS, ROUNDS);
-        return 0;
+        return isolated ? 0 : 1;
     }
 }
