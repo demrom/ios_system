@@ -1,0 +1,27 @@
+name: Stock OpenSSH XCFrameworks
+
+on:
+  push:
+    branches: [ci/stock-ssh-private-progname]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'demrom/ios_system'
+    runs-on: macos-26-intel
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and audit stock clients
+        run: bash ssh-stock/build-xcframeworks.sh "$RUNNER_TEMP/stock-openssh"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stock-openssh-xcframeworks
+          if-no-files-found: error
+          path: ${{ runner.temp }}/stock-openssh/dist/
