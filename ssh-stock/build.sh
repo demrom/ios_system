@@ -1,15 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 # Build stock OpenSSH client frameworks; the application owns signing and installation.
-if [ "$#" -ne 4 ]; then
-    echo "Usage: $0 <iphoneos|iphonesimulator> <source-inputs> <output> <verified-frameworks>" >&2
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+    echo "Usage: $0 <iphoneos|iphonesimulator> <source-inputs> <output> <verified-frameworks> [arm64|x86_64]" >&2
     exit 64
 fi
-sdk=$1; inputs=$2; output=$3; frameworks=$4
-case "$sdk" in
-    iphoneos) target=arm64-apple-ios16.0 ;;
-    iphonesimulator) target=arm64-apple-ios16.0-simulator ;;
-    *) echo "Unsupported SDK: $sdk" >&2; exit 64 ;;
+sdk=$1; inputs=$2; output=$3; frameworks=$4; arch=${5:-arm64}
+# Match the a-Shell mini deployment target.
+min_ios=15.0
+case "$sdk:$arch" in
+    iphoneos:arm64) target=arm64-apple-ios$min_ios ;;
+    iphonesimulator:arm64|iphonesimulator:x86_64) target=$arch-apple-ios$min_ios-simulator ;;
+    *) echo "Unsupported SDK/architecture: $sdk/$arch" >&2; exit 64 ;;
+esac
+case "$arch" in
+    arm64) host=aarch64-apple-darwin ;;
+    x86_64) host=x86_64-apple-darwin ;;
 esac
 recipe=$(cd "$(dirname "$0")" && pwd)
 runtime=$(cd "$recipe/.." && pwd)
@@ -46,9 +52,14 @@ ln -sfn "$frameworks/openssl.framework/Headers" "$output/crypto/include/openssl"
 ln -sfn "$frameworks/openssl.framework/openssl" "$output/crypto/lib/libcrypto.dylib"
 cd "$output/build"
 if [ ! -f Makefile ]; then
-    CC="xcrun --sdk $sdk clang -target $target" "$output/source/configure" --host=aarch64-apple-darwin --with-ssl-dir="$output/crypto" --without-pam --without-libedit --disable-strip --without-sandbox
+    # Even a native-architecture iOS slice must not execute configure probes on macOS.
+    CC="xcrun --sdk $sdk clang -target $target" "$output/source/configure" \
+        --build="$("$output/source/config.guess")" --host="$host" --with-ssl-dir="$output/crypto" \
+        --without-pam --without-libedit --disable-strip --without-sandbox
 fi
-nice -n 15 make -j2 CFLAGS="-Oz -fPIC -Wno-deprecated-declarations -DASHELL_OPENSSH -I$recipe -I$runtime" LDFLAGS="-dynamiclib -L. -Lopenbsd-compat -F$frameworks -framework ios_system -L$output/crypto/lib" ssh ssh-keygen scp sftp
+nice -n 15 make -j2 CFLAGS="-Oz -fPIC -Wno-deprecated-declarations -DASHELL_OPENSSH -I\"$recipe\" -I\"$runtime\"" \
+    LDFLAGS="-dynamiclib -Wl,-headerpad_max_install_names -L. -Lopenbsd-compat -F\"$frameworks\" -framework ios_system -L\"$output/crypto/lib\"" \
+    ssh ssh-keygen scp sftp
 for pair in 'ssh SSHStock' 'ssh-keygen SSHKeygenStock' 'scp SCPStock' 'sftp SFTPStock'; do
     read -r command name <<< "$pair"
     framework="$output/sdk/$name.framework"
@@ -58,7 +69,7 @@ for pair in 'ssh SSHStock' 'ssh-keygen SSHKeygenStock' 'scp SCPStock' 'sftp SFTP
     cat > "$framework/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>CFBundleExecutable</key><string>$name</string><key>CFBundleIdentifier</key><string>org.a-shell.$name</string><key>CFBundleName</key><string>$name</string><key>CFBundlePackageType</key><string>FMWK</string><key>CFBundleVersion</key><string>1</string><key>CFBundleShortVersionString</key><string>10.6p1</string><key>MinimumOSVersion</key><string>16.0</string></dict></plist>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>$name</string><key>CFBundleIdentifier</key><string>org.a-shell.$name</string><key>CFBundleName</key><string>$name</string><key>CFBundlePackageType</key><string>FMWK</string><key>CFBundleVersion</key><string>1</string><key>CFBundleShortVersionString</key><string>10.6p1</string><key>MinimumOSVersion</key><string>$min_ios</string></dict></plist>
 PLIST
     shasum -a 256 "$framework/$name"
 done

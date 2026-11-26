@@ -12,7 +12,9 @@ Download https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p1.tar
 bash ssh-stock/build.sh iphonesimulator INPUTS FRESH_OUTPUT VERIFIED_FRAMEWORKS
 ```
 
-Use iphoneos for device frameworks. VERIFIED_FRAMEWORKS contains matching ios_system.framework and openssl.framework inputs. The output contains four unsigned frameworks and source/toolchain/input receipts. Signing, embedding the frameworks and command registration belong to the application.
+Use `iphoneos` for device frameworks. Simulator defaults to `arm64`; pass `x86_64` as the fifth argument for an Intel Simulator slice, using a different output directory. `VERIFIED_FRAMEWORKS` contains matching `ios_system.framework` and `openssl.framework` inputs. The output contains four frameworks and source/toolchain/input receipts. Signing, embedding the frameworks and command registration belong to the application.
+
+The fork CI uses `bash ssh-stock/build-xcframeworks.sh NEW_OUTPUT` to download the pinned dependencies, build device arm64 and both Simulator architectures at minimum iOS 15, and package four XCFrameworks in `NEW_OUTPUT/dist`. CI publishes one `stock-openssh-xcframeworks` Actions artifact containing the four framework ZIPs, `checksums.txt`, and the audits and build receipts. To recheck a downloaded ZIP, verify its checksum, extract it, and run `bash ssh-stock/audit-xcframework.sh PATH.xcframework`. The audit checks the slices, dynamic library IDs and dependencies, and the command entry point. It does not execute the clients.
 
 Strict POSIX spawn remains extension-only.
 
