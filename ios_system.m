@@ -595,7 +595,7 @@ static void *runCommandHelper(void *context) {
     pthread_cleanup_push(releaseCommandHelper, helper);
     currentCommand = command;
     currentSession = command->session;
-    thread_stdin = command->stdin;
+    thread_stdin = command->stderr;
     thread_stdout = command->stdout;
     thread_stderr = command->stderr;
     thread_context = command->context;
@@ -817,7 +817,8 @@ static void waitNativeChildren(functionParameters *parameters) {
     for (;;) {
         bool active = parameters->helpers != NULL;
         for (functionParameters *command = nativeCommands; command; command = command->nativeNext)
-            if (command != parameters && commandContains(parameters, command)) active = true;
+            if (command != parameters && (commandContains(parameters, command) ||
+                (!parameters->nativeLaunch && command->nativeLaunch && command->session != parameters->session))) active = true;
         if (!active) break;
         pthread_cond_wait(&nativeDirectoryChanged, &nativeDirectoryMutex);
     }

@@ -393,7 +393,6 @@ void newPreviousDirectory(void) {
 void storeEnvironment(char* envp[]);
 static int storeEnvironmentForPid(char *const envp[], pid_t pid);
 static inline pid_t ios_nextAvailablePid(bool native) {
-    while (cleanup_counter > 0) { } // Don't start a command while another is ending.
     int cancellation = -1;
     if (!native) {
         pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
@@ -449,7 +448,7 @@ static inline pid_t ios_nextAvailablePid(bool native) {
             last_allocated_pid = 1;
         }
         pthread_t thread_pid = ios_getThreadId(allocatedPid);
-        if (thread_pid == 0 && !native_reservations[allocatedPid]) { // We found a not-active pid
+        if (thread_pid == 0) { // We found a not-active pid
             if (storeEnvironmentForPid(currentEnvironment, allocatedPid)) goto allocationFailed;
             native_reservations[allocatedPid] = native;
             command_status[allocatedPid] = 130; // Cancellation before a recorded exit.
@@ -790,8 +789,12 @@ __attribute__ ((optnone)) void ios_waitForPidCompletion(pid_t pid) {
 }
 
 void ios_waitpid(pid_t pid) {
+    int cancellation;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
     ios_waitForPidCompletion(pid);
     consume_wait_status(pid);
+    pthread_setcancelstate(cancellation, NULL);
+    pthread_testcancel();
 }
 
 __attribute__ ((optnone)) pid_t waitpid(pid_t pid, int *stat_loc, int options) {
