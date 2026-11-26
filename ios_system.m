@@ -899,7 +899,7 @@ __attribute__((visibility("default"))) int ashell_owned_command_name(FILE *outpu
         if (entry->streams[1] != output) continue;
         for (functionParameters *p = entry->commands; p; p = p->ownedNext) {
             if (!p->ownedRunning || p->backgroundCommand) continue;
-            int length = snprintf(name, capacity, "%s", p->ownedCommandName);
+            int length = snprintf(name, capacity, "%s", p->argv[0]);
             error = length < 0 || (size_t)length >= capacity ? ENOSPC : 0;
             break;
         }
