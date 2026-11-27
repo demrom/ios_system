@@ -761,8 +761,11 @@ pid_t waitpid(pid_t pid, int *stat_loc, int options) {
 // When that happens, we explicitly call this function (a copy of the previous one).
 // Also useful in Swift calls
 __attribute__ ((optnone)) pid_t ios_full_waitpid(pid_t pid, int *stat_loc, int options) {
-    if (pid > 0 && pid < IOS_MAX_THREADS && atomic_load(&reservedWorkerPid[pid]))
-        return ios_wait4(pid, stat_loc, options, NULL, NULL);
+    if (pid > 0 && pid < IOS_MAX_THREADS && atomic_load(&reservedWorkerPid[pid])) {
+        // The worker reports termination only, not job-control state changes.
+        // Keep accepting these waitpid options without claiming stop/continue support.
+        return ios_wait4(pid, stat_loc, options & ~(WUNTRACED | WCONTINUED), NULL, NULL);
+    }
     // pthread_join won't work,  because the thread might have been detached.
     // (and you can't re-join a detached thread).
     // -1 = the call waits for any child process (not good yet)

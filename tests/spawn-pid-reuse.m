@@ -100,22 +100,31 @@ static int checkExhaustion(const char *home, char **environment, char **command)
     return passed ? 0 : 1;
 }
 
-static int checkFullWait(pid_t child) {
+static int checkFullWait(pid_t child, BOOL compatibilityFlags) {
     int status = -1;
-    pid_t waited = ios_full_waitpid(child, &status, 0);
+    pid_t waited;
+    BOOL invalidRejected = YES;
+    if (compatibilityFlags) {
+        invalidRejected = ios_full_waitpid(child, &status, 0x40000000) == -1 && errno == EINVAL;
+        waited = ios_full_waitpid(child, &status, WNOHANG | WUNTRACED | WCONTINUED);
+        if (waited == 0) waited = ios_full_waitpid(child, &status, WUNTRACED);
+    } else {
+        waited = ios_full_waitpid(child, &status, 0);
+    }
     int secondStatus = -1;
     pid_t secondWait = ios_wait4(child, &secondStatus, WNOHANG, NULL, NULL);
     BOOL consumed = secondWait == -1 && errno == ECHILD;
-    BOOL passed = waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 7 && consumed;
-    fprintf(thread_stdout, "legacy wait reaps worker PID: %s (child=%d waited=%d status=%d consumed=%d)\n",
-            passed ? "PASS" : "FAIL", child, waited, status, consumed);
+    BOOL passed = waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 7 && consumed && invalidRejected;
+    fprintf(thread_stdout, "legacy wait reaps worker PID: %s (child=%d waited=%d status=%d consumed=%d flags=%d invalidRejected=%d)\n",
+            passed ? "PASS" : "FAIL", child, waited, status, consumed, compatibilityFlags, invalidRejected);
     return passed ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 3) return 64;
     BOOL exhaust = argc == 3 && !strcmp(argv[2], "exhaust");
-    BOOL fullWait = argc == 3 && !strcmp(argv[2], "full-wait");
+    BOOL compatibilityFlags = argc == 3 && !strcmp(argv[2], "full-wait-flags");
+    BOOL fullWait = compatibilityFlags || (argc == 3 && !strcmp(argv[2], "full-wait"));
     if (argc == 3 && !exhaust && !fullWait) return 64;
     interrupted = 0;
     char *home;
@@ -136,7 +145,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (fullWait) {
-        int result = checkFullWait(child);
+        int result = checkFullWait(child, compatibilityFlags);
         alarm(0);
         return result;
     }

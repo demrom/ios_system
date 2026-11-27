@@ -22,8 +22,9 @@ int ios_posix_spawn(pid_t *, const char *, const ios_posix_spawn_file_actions_t 
 /* Reap an ios_posix_spawn PID; options is 0 or WNOHANG. Returns PID, 0 while
  * running, or -1 with errno. Even after cancellation, the caller must reap the
  * child to release its PID. For status without usage, waitpid and
- * ios_full_waitpid also reap a positive worker PID; ios_waitpid only blocks.
- * Only one waiter may reap it. Status uses waitpid
+ * ios_full_waitpid also reap a positive worker PID. They accept WUNTRACED
+ * and WCONTINUED, but workers report termination only. ios_waitpid only
+ * blocks. Only one waiter may reap a child. Status uses waitpid
  * encoding (ios_killpid with SIGINT, SIGTERM, SIGKILL, SIGHUP or SIGQUIT:
  * exit 128 + signal; worker transport failure: exit 125).
  * Optional usage is the isolated worker's RUSAGE_SELF snapshot at command exit,

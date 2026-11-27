@@ -60,7 +60,9 @@ int ios_unsetenv(const char* variableName);
 extern char** environmentVariables(pid_t pid);
 extern NSArray* environmentAsArray(void);
 extern void storeEnvironment(char* envp[]);
-// Returns -1 with EAGAIN when worker children hold a full PID table.
+// Returns -1 with EAGAIN if the PID table is full and any worker reservation
+// exists. Waiting could block the caller that must reap a worker. Ordinary-only
+// contention still waits for a thread to release a slot.
 extern pid_t ios_fork(void);
 extern void ios_waitpid(pid_t pid);
 extern pid_t ios_full_waitpid(pid_t pid, int *stat_loc, int options);
