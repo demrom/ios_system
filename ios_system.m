@@ -84,6 +84,7 @@ typedef struct _sessionParameters {
     FILE* stdout;
     FILE* stderr;
     FILE* tty;
+    FILE* secretInput; // Borrowed from the nested worker; never protocol stdin.
     bool nativeTTY; // Native jobs use the actual descriptor terminal state.
     const void* context;
     _Atomic int global_errno; // written by command threads, read by the caller of ios_system
@@ -110,6 +111,7 @@ static void initSessionParameters(sessionParameters* sp) {
     sp->stdout = stdout;
     sp->stderr = stderr;
     sp->tty = stdin;
+    sp->secretInput = NULL;
     sp->nativeTTY = false;
     sp->context = nil;
     sp->numCommandsAllocated = 10; // 10 slots available to store commands, will realloc if more needed.
@@ -1011,6 +1013,7 @@ static bool hostWanted(const char *name) {
 typedef struct {
     size_t size;
     int tty, separate_stderr, stderr_fd;
+    const int *secret_input_fd;
 } workerPaneOptions;
 
 typedef struct {
@@ -1126,11 +1129,9 @@ static bool runInWorker(functionParameters *p, int *status, admittedWorker *admi
         // The worker reports a terminal and merges stderr unless told otherwise: pass what this command really has.
         workerPaneOptions options = { sizeof(options), ios_isatty(STDOUT_FILENO) != 0,
             p->stdout != NULL && p->stderr != NULL && fileno(p->stderr) != fileno(p->stdout), -1 };
-        // Stock ssh and ssh-keygen prompt on terminal input even with redirected output.
+        // Stock clients prompt from terminal input even with redirected output.
         if (workerRequired(p->argv[0])) {
-            if (!strcmp(p->argv[0], "ssh") || !strcmp(p->argv[0], "ssh-keygen")) {
-                options.tty = p->stdin && !p->asyncSpawn && ios_isatty(STDIN_FILENO);
-            }
+            options.tty = p->stdin && !p->asyncSpawn && ios_isatty(STDIN_FILENO);
             if (!strcmp(p->argv[0], "sftp")) {
                 ios_stopInteractive();
             }
@@ -1342,9 +1343,10 @@ static void *spawnedWorkerMain(void *argument) {
     return NULL;
 }
 
-int ios_posix_spawn(pid_t *pid, const char *path,
-                    const ios_posix_spawn_file_actions_t *actions,
-                    const void *attributes, char *const argv[], char *const envp[]) {
+static int spawnWorkerWithInput(pid_t *pid, const char *path,
+                                const ios_posix_spawn_file_actions_t *actions,
+                                const void *attributes, char *const argv[], char *const envp[],
+                                bool borrowSecretInput) {
     if (pid == NULL || path == NULL || argv == NULL || argv[0] == NULL) return EINVAL;
     if (attributes != NULL) return ENOTSUP;
     int (*spawn)(const char *, const char *, unsigned, unsigned, const char *const *, workerPaneOptions *, int *, void **) = workerAPI("spawn_ex");
@@ -1381,6 +1383,12 @@ int ios_posix_spawn(pid_t *pid, const char *path,
     char cwd[MAXPATHLEN];
     const char *directory = actions && actions->cwd ? actions->cwd : getcwd(cwd, sizeof(cwd));
     workerPaneOptions options = { sizeof(options), 0, 1, -1 };
+    int secretFd;
+    struct stat terminal;
+    if (borrowSecretInput && thread_stdin && ios_isatty(STDIN_FILENO) &&
+        (secretFd = fileno(thread_stdin)) >= 0 && fstat(secretFd, &terminal) == 0 &&
+        (S_ISSOCK(terminal.st_mode) || S_ISFIFO(terminal.st_mode)))
+        options.secret_input_fd = &secretFd;
     child->worker.fd = -1;
     int cancellationState;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellationState);
@@ -1421,6 +1429,18 @@ int ios_posix_spawn(pid_t *pid, const char *path,
     pthread_detach(thread);
     pthread_setcancelstate(cancellationState, NULL);
     return 0;
+}
+
+int ios_posix_spawn(pid_t *pid, const char *path,
+                    const ios_posix_spawn_file_actions_t *actions,
+                    const void *attributes, char *const argv[], char *const envp[]) {
+    return spawnWorkerWithInput(pid, path, actions, attributes, argv, envp, false);
+}
+
+int ios_posix_spawn_with_secret_input(pid_t *pid, const char *path,
+                                     const ios_posix_spawn_file_actions_t *actions,
+                                     char *const argv[], char *const envp[]) {
+    return spawnWorkerWithInput(pid, path, actions, NULL, argv, envp, true);
 }
 
 extern void ios_getoptReset(void); // restarts getopt for a new command (getopt.c)
@@ -3232,6 +3252,14 @@ void ios_useNativeTTY(bool enabled) {
 void ios_settty(FILE* _tty) {
     if (currentSession == NULL) return;
     currentSession->tty = _tty;
+}
+
+void ios_setSecretInput(FILE *input) {
+    if (currentSession != NULL) currentSession->secretInput = input;
+}
+
+FILE *ios_getSecretInput(void) {
+    return currentSession == NULL ? NULL : currentSession->secretInput;
 }
 
 int ios_gettty(void) {
