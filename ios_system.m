@@ -2732,6 +2732,10 @@ static int splitCommandAndExecute(char* command) {
         if ((nextAnd == NULL) && (nextOr == NULL)) {
             // Only one command left
             pid_t pid = ios_fork();
+            if (pid < 0) {
+                fprintf(thread_stderr, "sh: cannot allocate command PID: %s\n", strerror(errno));
+                return 1;
+            }
             returnValue = ios_system(command);
             NSLog(@"Started command, stored last_thread= %x pid: %d", currentSession->lastThreadId, pid);
             ios_waitpid(pid);
@@ -2751,6 +2755,10 @@ static int splitCommandAndExecute(char* command) {
         }
         command[nextCommandPosition] = 0; // terminate string
         pid_t pid = ios_fork();
+        if (pid < 0) {
+            fprintf(thread_stderr, "sh: cannot allocate command PID: %s\n", strerror(errno));
+            return 1;
+        }
         returnValue = ios_system(command);
         NSLog(@"Started command (2), stored last_thread= %x", currentSession->lastThreadId);
         ios_waitpid(pid);
@@ -2823,6 +2831,11 @@ int sh_main(int argc, char** argv) {
         // Only one command left
         argv[0][0] = 'h';  // prevent termination?
         pid_t pid = ios_fork();
+        if (pid < 0) {
+            fprintf(thread_stderr, "sh: cannot allocate command PID: %s\n", strerror(errno));
+            free(newCommand);
+            return 1;
+        }
         int returnValue = ios_system(newCommand);
         ios_waitpid(pid);
         free(newCommand);

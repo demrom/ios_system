@@ -19,6 +19,7 @@
 #include <dlfcn.h>  // for dlopen()/dlsym()/dlclose()
 
 #include "ios_error.h"
+#include "ios_spawn.h"
 #undef write
 #undef fwrite
 #undef puts
@@ -296,6 +297,12 @@ static int pidSlotIsFree(void) {
     return 0;
 }
 
+static bool hasReservedWorkerPid(void) {
+    for (int p = 1; p < IOS_MAX_THREADS; p++)
+        if (atomic_load(&reservedWorkerPid[p])) return true;
+    return false;
+}
+
 void ios_dropWorkerPid(pid_t pid) {
     atomic_store(&reservedWorkerPid[pid], false);
     notify_thread_completion();
@@ -334,18 +341,19 @@ static inline const pid_t ios_nextAvailablePid(bool worker) {
         if (++scanned > IOS_MAX_THREADS) {
             current_pid = previousPidId;
             pthread_mutex_unlock(&pid_mtx);
-            // A strict spawn caller may itself own the unreaped workers. It cannot wait here for them.
-            if (worker) return -1;
-            // Every slot is taken: wait for a command to end instead of spinning. pid_mtx is released while
-            // waiting, because an ending command waits for it before it frees its slot.
-            // pthread_cond_wait is a cancellation point and a cancelled thread would leave it holding
-            // thread_completion_mutex, which every ending command takes. Cancel arrives after the wait.
+            if (worker) { errno = EAGAIN; return -1; }
+            // Only ordinary slots are freed by thread exit. Waiting on a full table with
+            // reserved workers can deadlock the caller that must reap them.
+            // Keep pid_mtx released so ending commands can free their slots.
             int cancellation;
+            bool retry;
             pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
             pthread_mutex_lock(&thread_completion_mutex);
-            while (!pidSlotIsFree()) pthread_cond_wait(&thread_completed, &thread_completion_mutex);
+            while (!(retry = pidSlotIsFree()) && !hasReservedWorkerPid())
+                pthread_cond_wait(&thread_completed, &thread_completion_mutex);
             pthread_mutex_unlock(&thread_completion_mutex);
             pthread_setcancelstate(cancellation, NULL);
+            if (!retry) { errno = EAGAIN; return -1; }
             pthread_mutex_lock(&pid_mtx);
             currentEnvironment = environmentVariables(previousPidId); // ios_setenv may have reallocated it meanwhile
             scanned = 0;
@@ -759,32 +767,8 @@ __attribute__ ((optnone)) void ios_waitpid(pid_t pid) {
     return;
 }
 
-__attribute__ ((optnone)) pid_t waitpid(pid_t pid, int *stat_loc, int options) {
-    // pthread_join won't work,  because the thread might have been detached.
-    // (and you can't re-join a detached thread).
-    // -1 = the call waits for any child process (not good yet)
-    //  0 = the call waits for any child process in the process group of the caller
-    
-    if (options && WNOHANG) {
-        executeWebAssemblyCommandsInOrder(); // start executing webAssembly commands
-        // WNOHANG: just check that the process is still running:
-        pthread_t threadToWaitFor;
-        if ((pid == -1) || (pid == 0)) threadToWaitFor = ios_getLastThreadId();
-        else threadToWaitFor = ios_getThreadId(pid);
-        if (threadToWaitFor != 0) // the process is still running
-            return 0;
-        else {
-            if (stat_loc) *stat_loc = W_EXITCODE(wait_status(pid), 0);
-            fflush(thread_stdout);
-            fflush(thread_stderr);
-            return pid; // was "-1". See man page and https://github.com/holzschu/ios_system/issues/89
-        }
-    } else {
-        // Wait until the process is terminated:
-        ios_waitpid(pid);
-        if (stat_loc) *stat_loc = W_EXITCODE(wait_status(pid), 0);
-        return pid;
-    }
+pid_t waitpid(pid_t pid, int *stat_loc, int options) {
+    return ios_full_waitpid(pid, stat_loc, options);
 }
 
 // The previous function is designed to override the standard version of waitpid.
@@ -792,6 +776,8 @@ __attribute__ ((optnone)) pid_t waitpid(pid_t pid, int *stat_loc, int options) {
 // When that happens, we explicitly call this function (a copy of the previous one).
 // Also useful in Swift calls
 __attribute__ ((optnone)) pid_t ios_full_waitpid(pid_t pid, int *stat_loc, int options) {
+    if (pid > 0 && pid < IOS_MAX_THREADS && atomic_load(&reservedWorkerPid[pid]))
+        return ios_wait4(pid, stat_loc, options, NULL, NULL);
     // pthread_join won't work,  because the thread might have been detached.
     // (and you can't re-join a detached thread).
     // -1 = the call waits for any child process (not good yet)
