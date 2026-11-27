@@ -2,7 +2,7 @@ name: Stock OpenSSH XCFrameworks
 
 on:
   push:
-    branches: [ci/stock-ssh-secret-prompts]
+    branches: [ci/stock-ssh-secret-prompts, ci/stock-ssh-proxyjump]
 
 permissions:
   contents: read
