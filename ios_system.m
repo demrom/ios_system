@@ -433,6 +433,9 @@ static struct rusage pidUsage[IOS_PID_STATUS_SLOTS];
 static bool pidUsageAvailable[IOS_PID_STATUS_SLOTS];
 static bool pidWasSpawned[IOS_PID_STATUS_SLOTS];
 static bool pidWorkerReaping[IOS_PID_STATUS_SLOTS];
+// Protected by pidUsageMutex. Request -1 means the proxy has started cleanup.
+static int pidWorkerKillRequest[IOS_PID_STATUS_SLOTS];
+static int pidWorkerWaitSignal[IOS_PID_STATUS_SLOTS];
 extern pid_t ios_reserveWorkerPid(void);
 extern void ios_storeWorkerThread(pid_t pid, pthread_t thread);
 extern void ios_dropWorkerPid(pid_t pid);
@@ -449,6 +452,8 @@ void ios_resetPidWorkerState(pid_t pid) {
     pthread_mutex_lock(&pidUsageMutex);
     pidWasSpawned[pid] = false;
     pidUsageAvailable[pid] = false;
+    pidWorkerKillRequest[pid] = 0;
+    pidWorkerWaitSignal[pid] = 0;
     pthread_mutex_unlock(&pidUsageMutex);
 }
 
@@ -483,8 +488,10 @@ pid_t ios_wait4(pid_t pid, int *status, int options, struct rusage *usage, int *
 
     pthread_cleanup_push(abandonWorkerReap, &pid);
     if (options == 0) ios_waitForThreadCompletion(pid);
-    if (status) *status = W_EXITCODE(ios_pidStatus(pid), 0);
+    // The proxy has published its status and the slot remains reserved until reap.
+    int exitCode = status ? ios_pidStatus(pid) : 0;
     pthread_mutex_lock(&pidUsageMutex);
+    if (status) *status = W_EXITCODE(pidWorkerWaitSignal[pid] ? 0 : exitCode, pidWorkerWaitSignal[pid]);
     if (usage && pidUsageAvailable[pid]) *usage = pidUsage[pid];
     if (available) *available = pidUsageAvailable[pid];
     pidWasSpawned[pid] = false;
@@ -494,6 +501,29 @@ pid_t ios_wait4(pid_t pid, int *status, int options, struct rusage *usage, int *
     // Allow the allocator to overwrite status only after the reap has copied it.
     ios_dropWorkerPid(pid);
     return pid;
+}
+
+int ios_kill_worker(pid_t pid, int sig) {
+    if (sig < 0 || sig >= NSIG) return EINVAL;
+    if (pid <= 0) return ENOTSUP; // No worker process groups.
+    if (pid >= IOS_PID_STATUS_SLOTS) return ESRCH;
+    pthread_mutex_lock(&pidUsageMutex);
+    int result = 0;
+    if (!pidWasSpawned[pid]) result = ESRCH;
+    else if (sig != 0 && sig != SIGHUP && sig != SIGINT && sig != SIGQUIT && sig != SIGKILL && sig != SIGTERM)
+        result = ENOTSUP;
+    // Signal zero and an already-completing child need no proxy signal.
+    else if (sig != 0 && pidWorkerKillRequest[pid] == 0) {
+        pthread_t thread = atomic_load(&pidWorkerThread[pid]);
+        if (thread == NULL || ios_getThreadId(pid) != thread) result = ESRCH;
+        else {
+            pidWorkerKillRequest[pid] = sig;
+            result = pthread_cancel(thread);
+            if (result) pidWorkerKillRequest[pid] = 0;
+        }
+    }
+    pthread_mutex_unlock(&pidUsageMutex);
+    return result;
 }
 
 static pthread_mutex_t commandSignalMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1041,9 +1071,9 @@ typedef struct {
     int fd;
     int errFd;
     void *job;
-    bool finished;
+    int state, status;
     pid_t pid;
-    bool host;
+    bool host, strict;
 } workerRun;
 
 static void *workerAPI(const char *suffix) {
@@ -1065,17 +1095,65 @@ static void *executionAPI(const char *suffix, bool host) {
     return dlsym(RTLD_DEFAULT, symbol);
 }
 
+static void collectWorkerUsage(workerRun *run, int *status) {
+    if (run->pid < 0 || run->pid >= IOS_PID_STATUS_SLOTS) return;
+    int (*poll_usage)(void *, int *, struct rusage *, int *) = executionAPI("poll_usage", run->host);
+    struct rusage usage;
+    int available = 0;
+    if (poll_usage && poll_usage(run->job, status, &usage, &available) == 1 && available) {
+        pthread_mutex_lock(&pidUsageMutex);
+        pidUsage[run->pid] = usage;
+        pidUsageAvailable[run->pid] = true;
+        pthread_mutex_unlock(&pidUsageMutex);
+    }
+}
+
 static void workerRunCleanup(void *argument) {
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     workerRun *run = argument;
     int (*cancel)(void *) = executionAPI("cancel", run->host);
     void (*release)(void *) = executionAPI("release", run->host);
-    if (!run->finished && cancel) {
-        int error = cancel(run->job);
+    int requested = 0;
+    if (run->strict) {
+        pthread_mutex_lock(&pidUsageMutex);
+        requested = pidWorkerKillRequest[run->pid];
+        // Prevent a new cancellation from racing proxy exit or relabeling this reap.
+        pidWorkerKillRequest[run->pid] = -1;
+        pthread_mutex_unlock(&pidUsageMutex);
+    }
+    if (run->strict && run->state != 0) {
+        // Poll already observed a terminal state. Finalize it with proxy
+        // cancellation disabled, including the broker usage query.
+        if (run->state == 1) collectWorkerUsage(run, &run->status);
+        recordPidStatus(run->state == 1 ? run->status : 125);
+    } else if (run->state == 0 && cancel) {
         int signal = run->pid >= 0 && run->pid < IOS_PID_STATUS_SLOTS
             ? atomic_load(&pidWorkerSignal[run->pid]) : 0;
         int status = 128 + (signal ? signal : SIGKILL);
-        if (run->host && error) {
+        if (requested > 0) {
+            // A live proxy may still have output to drain after the command
+            // finished. Preserve completion before asking the broker to cancel.
+            int (*poll_job)(void *, int *) = executionAPI("poll", run->host);
+            int state = poll_job(run->job, &status);
+            if (state == 1) {
+                collectWorkerUsage(run, &status);
+                run->state = 1;
+            } else if (state == 0 && cancel(run->job) == 0) {
+                pthread_mutex_lock(&pidUsageMutex);
+                pidWorkerWaitSignal[run->pid] = requested;
+                pthread_mutex_unlock(&pidUsageMutex);
+                status = 128 + requested;
+                run->state = 1;
+            } else if (poll_job(run->job, &status) == 1) {
+                collectWorkerUsage(run, &status);
+                run->state = 1;
+            } else {
+                status = 125;
+            }
+            // Cleanup can also be called after the pump times out normally.
+            // Do not let that return path overwrite a result observed here.
+            run->status = status;
+        } else if (cancel(run->job) && run->host) {
             // Host cancellation can be unsupported. Keep its admission and drain
             // abandoned output until the actual command completes; a rejected
             // cancellation must not publish a synthetic signal status.
@@ -1180,7 +1258,10 @@ static bool runInWorker(functionParameters *p, int *status, admittedWorker *admi
         }
         errFd = spawn_ex ? options.stderr_fd : -1;
     }
-    workerRun run = { fd, errFd, job, false, p->pid, host };
+    workerRun run = {
+        .fd = fd, .errFd = errFd, .job = job, .status = 137,
+        .pid = p->pid, .host = host, .strict = admitted != NULL
+    };
     pthread_mutex_lock(&commandSignalMutex);
     if (p->pid >= 0 && p->pid < IOS_PID_STATUS_SLOTS) {
         // An interrupt can arrive while spawn has cancellation disabled.
@@ -1191,7 +1272,7 @@ static bool runInWorker(functionParameters *p, int *status, admittedWorker *admi
     // Honor explicit background input redirects without consuming inherited terminal input.
     int stdinFd = (p->stdin == NULL || (p->asyncSpawn && !p->isPipeIn)) ? -1 : fileno(p->stdin);
     if (stdinFd < 0) close_stdin(job);
-    int exitStatus = 137, state = 0;
+    int state = 0;
     size_t inputBytes = 0, outputBytes = 0;
     pthread_cleanup_push(workerRunCleanup, &run);
     // Publish the PID only after cancellation owns the admitted worker.
@@ -1262,26 +1343,16 @@ static bool runInWorker(functionParameters *p, int *status, admittedWorker *admi
         fflush(p->stderr);
     }
     for (int tries = 0; tries < 200; tries++) {
-        state = poll_job(job, &exitStatus);
+        state = poll_job(job, &run.status);
         if (state != 0) break;
         usleep(10000);
     }
-    run.finished = (state != 0);
-    if (state == 1 && p->pid >= 0 && p->pid < IOS_PID_STATUS_SLOTS) {
-        int (*poll_usage)(void *, int *, struct rusage *, int *) = executionAPI("poll_usage", host);
-        struct rusage usage;
-        int available = 0;
-        if (poll_usage && poll_usage(job, &exitStatus, &usage, &available) == 1 && available) {
-            pthread_mutex_lock(&pidUsageMutex);
-            pidUsage[p->pid] = usage;
-            pidUsageAvailable[p->pid] = true;
-            pthread_mutex_unlock(&pidUsageMutex);
-        }
-    }
+    run.state = state;
+    if (!run.strict && state == 1) collectWorkerUsage(&run, &run.status);
     pthread_cleanup_pop(1);
-    if (state == 1) *status = exitStatus;
+    if (run.state == 1) *status = run.status;
     else {
-        int error = state < 0 ? -state : ETIMEDOUT;
+        int error = run.state < 0 ? -run.state : ETIMEDOUT;
         fprintf(p->stderr, "worker connection failed: %s\n", strerror(error));
         fflush(p->stderr);
         *status = 125;

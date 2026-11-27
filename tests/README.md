@@ -245,6 +245,8 @@ The arm64 Simulator host with five workers on Xcode 27.1 exited 0 with `CPU chil
 
 `spawn-context.m` uses `ios_posix_spawn`, `ios_wait4` and `ios_killpid` in a disposable worker-enabled host. It changes the parent cwd while a child sleeps, then verifies completion preserves the parent cwd. A second child receives SIGTERM; wait must return exit 143 while the parent command status stays unchanged.
 
+`spawn-signal.m` checks the worker-only `ios_kill_worker` API through the same host. It probes a real child, rejects group and unsupported signals, cancels it with SIGTERM, and requires a signaled `ios_full_waitpid` result. A separate child that exits 143 must still report normal exit when signaled after the completion barrier but before `ios_wait4` reaps it. The PID must no longer be signalable after reap.
+
 Build/register it as a command framework with `-Dmain=spawn_context_main`, Foundation and the matching ios_system framework. Register `spawn-context` as `["SpawnContextChecks.framework/SpawnContextChecks", "spawn_context_main", "", "file"]`, provide its empty app/bin marker, and pass the disposable host HOME as its only argument. The baseline fails the cwd check; the fixed implementation must pass both checks.
 
 # Spawned PID ownership
