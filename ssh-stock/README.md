@@ -20,6 +20,10 @@ When opening `/dev/tty` fails with `ENXIO` or the worker sandbox denies it with 
 
 Stock `ssh-keygen` reads passphrases from the echo-free foreground terminal. Press Return at both prompts to choose an empty passphrase; EOF or rejected input aborts instead of saving an unencrypted key. Use the existing `-N` and `-P` options for noninteractive input. The Simulator regression is `tests/stock-ssh-confirm.py SIMULATOR VERIFIED_FRAMEWORKS OUTPUT/sdk --keygen-only`.
 
+Stock `scp` and `sftp` lend virtual terminal input to their Stock SSH child over the worker broker. The child reads authentication answers from that separate stream; its stdin/stdout remain the transfer protocol. This requires the matching app worker broker as well as the client frameworks and ios_system runtime. Redirected stdin and SSH `BatchMode` do not make a secret prompt available.
+
+For the Simulator check, install the paired app and frameworks, activate Stock clients, and focus the app terminal in Documents. Use a disposable SSH server with `/fixture/payload`, a known host key, password authentication, and both an encrypted and an unencrypted identity. In `Documents/stock-transfer/config`, configure `stockpw`, `stockkey`, and `stockcontrol` with strict known-host checking and respectively password-only, encrypted-key-only, and unencrypted-key-only authentication. In `Documents/stock-transfer/batch`, put `get /fixture/payload stock-transfer/sftp-batch.recv` followed by `bye`. With the synthetic answers and the expected `payload` in `FIXTURE/{password,phrase,payload}`, run `bash tests/stock-transfer-prompts.sh SIMULATOR FIXTURE`. Before rerunning, move the previous `.out`, `.err`, and `.recv` files out of `Documents/stock-transfer`; keep its config, keys, and batch file. The driver retains its outputs there and refuses stale files. It checks prompts, that answers are absent from captured stdout and stderr, exact payloads, and noninteractive controls through the app's actual Stock commands.
+
 Strict POSIX spawn remains extension-only.
 
 The recipe retains the supplied OpenSSL version. The tested input was OpenSSL 1.1.1w; updating that dependency is separate work.

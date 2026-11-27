@@ -28,13 +28,19 @@
 #define isatty ios_isatty
 
 #define printf(...) fprintf(thread_stdout, __VA_ARGS__)
-static inline int ashell_ssh_spawn(const char *path, char *const argv[], int input, int output, pid_t *pid) {
+static inline int ashell_ssh_spawn(const char *path, const char *stock_path, char *const argv[], int input, int output, pid_t *pid) {
     ios_posix_spawn_file_actions_t actions;
     int error = ios_posix_spawn_file_actions_init(&actions);
     if (error) return error;
     error = ios_posix_spawn_file_actions_adddup2(&actions, input, 0);
     if (!error) error = ios_posix_spawn_file_actions_adddup2(&actions, output, 1);
-    if (!error) error = ios_posix_spawn(pid, path, &actions, NULL, argv, environmentVariables(ios_currentPid()));
+    if (!error) {
+        char **envp = environmentVariables(ios_currentPid());
+        if (!strcmp(path, stock_path) || !strcmp(path, "ssh"))
+            error = ios_posix_spawn_with_secret_input(pid, path, &actions, argv, envp);
+        else
+            error = ios_posix_spawn(pid, path, &actions, NULL, argv, envp);
+    }
     ios_posix_spawn_file_actions_destroy(&actions);
     return error;
 }
