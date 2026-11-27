@@ -25,6 +25,10 @@ int ios_posix_spawn(pid_t *, const char *, const ios_posix_spawn_file_actions_t 
  * the returned PID and an unreaped child. */
 #define IOS_WORKER_KILL_SUPPORTED 1
 int ios_kill_worker(pid_t, int);
+/* Report readiness of an owned, unreaped worker without consuming its
+ * status or PID. Returns PID, 0 while active, or -1 with errno. */
+#define IOS_WORKER_PEEK_SUPPORTED 1
+pid_t ios_peek_worker(pid_t pid);
 /* Reap an ios_posix_spawn PID; options is 0 or WNOHANG. Returns PID, 0 while
  * running, or -1 with errno. Even after cancellation, the caller must reap the
  * child to release its PID. For status without usage, waitpid and

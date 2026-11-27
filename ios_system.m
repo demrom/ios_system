@@ -468,6 +468,21 @@ static void abandonWorkerReap(void *argument) {
     pthread_mutex_unlock(&pidUsageMutex);
 }
 
+pid_t ios_peek_worker(pid_t pid) {
+    if (pid <= 0 || pid >= IOS_PID_STATUS_SLOTS) { errno = ECHILD; return -1; }
+    pthread_mutex_lock(&pidUsageMutex);
+    if (!pidWasSpawned[pid] || pidWorkerReaping[pid]) {
+        pthread_mutex_unlock(&pidUsageMutex);
+        errno = ECHILD;
+        return -1;
+    }
+    // A proxy publishes its wait result before clearing the thread ID. Use
+    // the same readiness check as WNOHANG but leave the reap claim untouched.
+    pid_t result = ios_getThreadId(pid) == 0 ? pid : 0;
+    pthread_mutex_unlock(&pidUsageMutex);
+    return result;
+}
+
 pid_t ios_wait4(pid_t pid, int *status, int options, struct rusage *usage, int *available) {
     if (available) *available = 0;
     if (usage) memset(usage, 0, sizeof(*usage));

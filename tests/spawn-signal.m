@@ -22,15 +22,20 @@ int main(int argc, char **argv) {
     int error = ios_posix_spawn(&child, sleeper[0], NULL, NULL, sleeper, environment);
     if (error) return 92;
     if (ios_kill_worker(child, 0) || ios_wait4(child, &status, WNOHANG, NULL, NULL) || status != -123) return 93;
+    if (ios_peek_worker(child) != 0) return 101;
     if (ios_kill_worker(child, SIGUSR1) != ENOTSUP || ios_kill_worker(child, -1) != EINVAL) return 94;
     if (ios_kill_worker(child, SIGTERM)) return 95;
+    ios_waitpid(child); // Completion barrier, not a reap.
+    if (ios_peek_worker(child) != child || ios_peek_worker(child) != child) return 102;
     if (ios_full_waitpid(child, &status, 0) != child || !WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) return 96;
     if (ios_kill_worker(child, 0) != ESRCH) return 97;
+    if (ios_peek_worker(child) != -1 || errno != ECHILD) return 103;
 
     error = ios_posix_spawn(&child, normal[0], NULL, NULL, normal, environment);
     if (error) return 98;
     ios_waitpid(child); // Completion barrier, not a reap.
     if (ios_kill_worker(child, SIGTERM) || ios_kill_worker(child, 0)) return 99;
+    if (ios_peek_worker(child) != child) return 104;
     if (ios_wait4(child, &status, 0, NULL, NULL) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 143) return 100;
     fprintf(thread_stdout, "worker signal and normal exit distinguished: PASS\n");
     return 0;
