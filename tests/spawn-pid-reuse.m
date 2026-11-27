@@ -22,7 +22,13 @@ static void *ordinaryThread(void *unused) {
     for (int n = 0; n < 100 && !interrupted; n++) usleep(10000);
     return NULL;
 }
-static int checkExhaustion(char **environment, char **command) {
+static int checkExhaustion(const char *home, char **environment, char **command) {
+    char *marker;
+    if (asprintf(&marker, "%s/spawn-exhaust-XXXXXX", home) < 0) return 1;
+    int fd = mkstemp(marker);
+    if (fd < 0) { free(marker); return 1; }
+    close(fd);
+    if (unlink(marker)) { free(marker); return 1; }
     pid_t children[256];
     size_t count = 0;
     int error = 0;
@@ -34,8 +40,19 @@ static int checkExhaustion(char **environment, char **command) {
     }
     if (!count || error != EAGAIN) {
         fprintf(thread_stderr, "worker PID exhaustion: FAIL (count=%zu spawn=%d)\n", count, error);
+        free(marker);
         return 1;
     }
+
+    // An absent cwd distinguishes an early EAGAIN from attempting broker admission.
+    ios_posix_spawn_file_actions_t actions;
+    ios_posix_spawn_file_actions_init(&actions);
+    int setup = ios_posix_spawn_file_actions_addchdir_np(&actions, marker);
+    pid_t excess = -1;
+    int fullInvalidCwd = setup ? setup : ios_posix_spawn(&excess, command[0], &actions, NULL, command, environment);
+    char *writeMarker[] = { "dash", "-c", ": > \"$1\"", "dash", marker, NULL };
+    int fullValidCwd = ios_posix_spawn(&excess, writeMarker[0], NULL, NULL, writeMarker, environment);
+    BOOL notAdmitted = fullInvalidCwd == EAGAIN && fullValidCwd == EAGAIN;
 
     // Rescue a blocked allocator after a bounded delay so the original bug yields a receipt.
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -56,16 +73,30 @@ static int checkExhaustion(char **environment, char **command) {
     dispatch_group_wait(watchdog, DISPATCH_TIME_FOREVER);
 
     int status = -1;
-    BOOL reaped = YES;
-    for (size_t n = rescued ? 1 : 0; n < count; ++n) {
+    BOOL reaped = rescued || (ios_wait4(first, &status, 0, NULL, NULL) == first &&
+                             WIFEXITED(status) && WEXITSTATUS(status) == 7);
+    BOOL noMarker = access(marker, F_OK) == -1 && errno == ENOENT;
+    if (!noMarker) unlink(marker);
+    // Only one slot is free: a failed admission must return it for the next spawn.
+    int rejected = setup ? setup : ios_posix_spawn(&excess, command[0], &actions, NULL, command, environment);
+    ios_posix_spawn_file_actions_destroy(&actions);
+    int next = ios_posix_spawn(&excess, command[0], NULL, NULL, command, environment);
+    status = -1;
+    BOOL rolledBack = rejected != 0 && rejected != EAGAIN && next == 0 &&
+                      ios_wait4(excess, &status, 0, NULL, NULL) == excess &&
+                      WIFEXITED(status) && WEXITSTATUS(status) == 7;
+    for (size_t n = 1; n < count; ++n) {
         if (ios_wait4(children[n], &status, 0, NULL, NULL) != children[n] ||
             !WIFEXITED(status) || WEXITSTATUS(status) != 7) reaped = NO;
     }
     pid_t recovered = ios_fork();
     if (recovered > 0) ios_storeThreadId(NULL);
-    BOOL passed = !rescued && attempt == -1 && savedError == EAGAIN && reaped && recovered > 0;
-    fprintf(thread_stdout, "unreaped worker PID exhaustion: %s (children=%zu blocked=%d fork=%d EAGAIN=%d reaped=%d recovered=%d)\n",
-            passed ? "PASS" : "FAIL", count, rescued, attempt, savedError == EAGAIN, reaped, recovered > 0);
+    BOOL passed = !rescued && attempt == -1 && savedError == EAGAIN && reaped && recovered > 0 &&
+                  notAdmitted && noMarker && rolledBack;
+    fprintf(thread_stdout, "unreaped worker PID exhaustion: %s (children=%zu blocked=%d fork=%d EAGAIN=%d reaped=%d recovered=%d invalidCwd=%d validCwd=%d noMarker=%d rollback=%d)\n",
+            passed ? "PASS" : "FAIL", count, rescued, attempt, savedError == EAGAIN, reaped, recovered > 0,
+            fullInvalidCwd, fullValidCwd, noMarker, rolledBack);
+    free(marker);
     return passed ? 0 : 1;
 }
 
@@ -91,7 +122,7 @@ int main(int argc, char **argv) {
     if (asprintf(&home, "HOME=%s", argv[1]) < 0) return 1;
     char *environment[] = { home, NULL }, *command[] = { "dash", "-c", "exit 7", NULL };
     if (exhaust) {
-        int result = checkExhaustion(environment, command);
+        int result = checkExhaustion(argv[1], environment, command);
         free(home);
         return result;
     }
@@ -116,6 +147,7 @@ int main(int argc, char **argv) {
     BOOL reusedBeforeWait = NO;
     for (int n = 0; n < 256; n++) {
         pid_t candidate = ios_fork();
+        if (candidate < 0) return 1;
         ios_storeThreadId(NULL);
         if (candidate == child) {
             reusedBeforeWait = YES;
@@ -134,6 +166,7 @@ int main(int argc, char **argv) {
     BOOL passed = NO;
     for (int n = 0; n < 256; n++) {
         pid_t candidate = ios_fork();
+        if (candidate < 0) return 1;
         if (candidate != child) { ios_storeThreadId(NULL); continue; }
         struct sigaction action = {0}, saved = {0};
         action.sa_handler = receivedInterrupt;

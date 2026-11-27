@@ -433,7 +433,8 @@ static struct rusage pidUsage[IOS_PID_STATUS_SLOTS];
 static bool pidUsageAvailable[IOS_PID_STATUS_SLOTS];
 static bool pidWasSpawned[IOS_PID_STATUS_SLOTS];
 static bool pidWorkerReaping[IOS_PID_STATUS_SLOTS];
-extern pid_t ios_forkWorker(void);
+extern pid_t ios_reserveWorkerPid(void);
+extern void ios_storeWorkerThread(pid_t pid, pthread_t thread);
 extern void ios_dropWorkerPid(pid_t pid);
 extern void ios_waitForThreadCompletion(pid_t pid);
 
@@ -1329,6 +1330,8 @@ int ios_posix_spawn_file_actions_addchdir_np(ios_posix_spawn_file_actions_t *act
 typedef struct {
     functionParameters command;
     admittedWorker worker;
+    void *start;
+    bool admitted;
 } spawnedWorker;
 
 static void spawnedWorkerCleanup(void *argument) {
@@ -1339,18 +1342,25 @@ static void spawnedWorkerCleanup(void *argument) {
     fclose(spawned->command.stdin);
     fclose(spawned->command.stdout);
     fclose(spawned->command.stderr);
-    ios_releaseBackgroundThreadId(spawned->command.pid);
+    ios_storeWorkerThread(spawned->command.pid, NULL);
     free(spawned);
 }
 static void *spawnedWorkerMain(void *argument) {
     spawnedWorker *spawned = argument;
+    dispatch_semaphore_t start = CFBridgingRelease(spawned->start);
+    dispatch_semaphore_wait(start, DISPATCH_TIME_FOREVER);
+    if (!spawned->admitted) {
+        CFBridgingRelease(spawned->worker.ready);
+        spawnedWorkerCleanup(spawned);
+        return NULL;
+    }
     functionParameters *p = &spawned->command;
     commandPid = p->pid;
     currentSession = NULL;
     thread_stdin = p->stdin;
     thread_stdout = p->stdout;
     thread_stderr = p->stderr;
-    ios_storeThreadIdForPid(p->pid, pthread_self());
+    ios_storeWorkerThread(p->pid, pthread_self());
     pthread_cleanup_push(spawnedWorkerCleanup, spawned);
     int status = 127;
     runInWorker(p, &status, &spawned->worker);
@@ -1365,9 +1375,7 @@ int ios_posix_spawn(pid_t *pid, const char *path,
     if (pid == NULL || path == NULL || argv == NULL || argv[0] == NULL) return EINVAL;
     if (attributes != NULL) return ENOTSUP;
     int (*spawn)(const char *, const char *, unsigned, unsigned, const char *const *, workerPaneOptions *, int *, void **) = workerAPI("spawn_ex");
-    int (*cancel)(void *) = workerAPI("cancel");
-    void (*release)(void *) = workerAPI("release");
-    if (!spawn || !cancel || !release || !workerAPI("poll") ||
+    if (!spawn || !workerAPI("cancel") || !workerAPI("release") || !workerAPI("poll") ||
         !workerAPI("close_stdin")) return ENOTSUP;
     int descriptors[3] = { fileno(thread_stdin), fileno(thread_stdout), fileno(thread_stderr) };
     if (actions) {
@@ -1401,37 +1409,39 @@ int ios_posix_spawn(pid_t *pid, const char *path,
     child->worker.fd = -1;
     int cancellationState;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellationState);
-    int error = directory ? spawn(line.UTF8String, directory, 80, 24,
-        (const char *const *)envp, &options, &child->worker.fd, &child->worker.job) : errno;
-    if (error != 0) {
+    pid_t childPid = directory ? ios_reserveWorkerPid() : -1;
+    if (childPid < 0) {
+        int error = errno;
         for (int i = 0; i < 3; i++) fclose(*streams[i]);
         free(child);
         pthread_setcancelstate(cancellationState, NULL);
         return error;
     }
-    child->worker.errFd = options.stderr_fd;
-    pid_t childPid = ios_forkWorker();
+    child->command.pid = childPid;
+    child->command.isPipeIn = true;
+    dispatch_semaphore_t start = dispatch_semaphore_create(0);
+    dispatch_semaphore_t ready = dispatch_semaphore_create(0);
+    child->start = (__bridge_retained void *)start;
+    child->worker.ready = (__bridge_retained void *)ready;
     pthread_t thread;
-    dispatch_semaphore_t ready = NULL;
-    if (childPid > 0) {
-        child->command.pid = childPid;
-        child->command.isPipeIn = true;
-        ready = dispatch_semaphore_create(0);
-        child->worker.ready = (__bridge_retained void *)ready;
-        error = pthread_create(&thread, NULL, spawnedWorkerMain, child);
-        if (error) {
-            CFBridgingRelease(child->worker.ready);
-            ios_dropWorkerPid(childPid);
-            ios_storeThreadIdForPid(childPid, NULL);
-        }
-    } else error = EAGAIN;
+    int error = pthread_create(&thread, NULL, spawnedWorkerMain, child);
     if (error) {
-        cancel(child->worker.job);
-        release(child->worker.job);
-        close(child->worker.fd);
-        if (child->worker.errFd >= 0) close(child->worker.errFd);
-        for (int i = 0; i < 3; i++) fclose(*streams[i]);
-        free(child);
+        CFBridgingRelease(child->start);
+        CFBridgingRelease(child->worker.ready);
+        spawnedWorkerCleanup(child);
+        ios_dropWorkerPid(childPid);
+        pthread_setcancelstate(cancellationState, NULL);
+        return error;
+    }
+    // Do not let the broker start a command until both PID and proxy are available.
+    error = spawn(line.UTF8String, directory, 80, 24,
+        (const char *const *)envp, &options, &child->worker.fd, &child->worker.job);
+    child->worker.errFd = options.stderr_fd;
+    child->admitted = error == 0;
+    dispatch_semaphore_signal(start);
+    if (error) {
+        pthread_join(thread, NULL);
+        ios_dropWorkerPid(childPid);
         pthread_setcancelstate(cancellationState, NULL);
         return error;
     }

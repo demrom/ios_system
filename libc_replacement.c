@@ -308,83 +308,68 @@ void ios_dropWorkerPid(pid_t pid) {
     notify_thread_completion();
 }
 
-// We do not recycle process ids too quickly to avoid collisions.
+// The caller holds pid_mtx. Workers get a slot, not a host thread's cwd or environment.
 void storeEnvironment(char* envp[]);
 extern void ios_resetPidWorkerState(pid_t pid);
-static inline const pid_t ios_nextAvailablePid(bool worker) {
+static pid_t claimPidSlot(pid_t pid, bool worker) {
+    last_allocated_pid = pid;
+    reservedWorkerPid[pid] = worker;
+    command_status[pid] = 130; // Cancellation before a recorded exit.
+    ios_resetPidWorkerState(pid);
+    thread_ids[pid] = -1; // Not yet started
+    if (worker) {
+        pthread_mutex_unlock(&pid_mtx);
+    } else {
+        pid_t parent = current_pid;
+        char **currentEnvironment = environmentVariables(parent);
+        current_pid = pid;
+        numVariablesSet[pid] = 0;
+        environment[pid] = NULL;
+        storeEnvironment(currentEnvironment);
+        getwd(previousDirectory[pid]);
+        previousPid[pid] = parent;
+        // Ordinary command registration releases pid_mtx.
+    }
+    return pid;
+}
+
+static pid_t ios_nextAvailablePid(bool worker) {
     ios_cleanupWait(); // Don't start a command while another is ending.
-    // fprintf(stderr, "Locking in ios_nextAvailablePid\n");
     pthread_mutex_lock(&pid_mtx);
-    char** currentEnvironment = environmentVariables(current_pid);
-    int previousPidId = current_pid;
-    if (!pid_overflow && (last_allocated_pid < IOS_MAX_THREADS - 1)
-        && pidSlotAvailable(last_allocated_pid + 1)) {
-        current_pid = last_allocated_pid + 1;
-        last_allocated_pid = current_pid;
-        reservedWorkerPid[current_pid] = worker;
-        command_status[current_pid] = 130; // Cancellation before a recorded exit.
-        ios_resetPidWorkerState(current_pid);
-        thread_ids[current_pid] = -1; // Not yet started
-        numVariablesSet[current_pid] = 0;
-        environment[current_pid] = NULL;
-        storeEnvironment(currentEnvironment); // duplicate the environment variables
-        getwd(previousDirectory[current_pid]); // store current working directory
-        previousPid[current_pid] = previousPidId;
-        // fprintf(stderr, "Returning from ios_nextAvailablePid, pid= %d\n", current_pid);
-        return current_pid;
-    }
-    // We've already started more than IOS_MAX_THREADS threads.
-    if (!pid_overflow) current_pid = 0; // first time over the limit
+    // We do not recycle process ids too quickly to avoid collisions.
+    if (!pid_overflow && last_allocated_pid < IOS_MAX_THREADS - 1 &&
+        pidSlotAvailable(last_allocated_pid + 1))
+        return claimPidSlot(last_allocated_pid + 1, worker);
+
     pid_overflow = 1;
-    int scanned = 0;
-    while (1) {
-        if (++scanned > IOS_MAX_THREADS) {
-            current_pid = previousPidId;
-            pthread_mutex_unlock(&pid_mtx);
-            if (worker) { errno = EAGAIN; return -1; }
-            // Only ordinary slots are freed by thread exit. Waiting on a full table with
-            // reserved workers can deadlock the caller that must reap them.
-            // Keep pid_mtx released so ending commands can free their slots.
-            int cancellation;
-            bool retry;
-            pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
-            pthread_mutex_lock(&thread_completion_mutex);
-            while (!(retry = pidSlotIsFree()) && !hasReservedWorkerPid())
-                pthread_cond_wait(&thread_completed, &thread_completion_mutex);
-            pthread_mutex_unlock(&thread_completion_mutex);
-            pthread_setcancelstate(cancellation, NULL);
-            if (!retry) { errno = EAGAIN; return -1; }
-            pthread_mutex_lock(&pid_mtx);
-            currentEnvironment = environmentVariables(previousPidId); // ios_setenv may have reallocated it meanwhile
-            scanned = 0;
+    for (;;) {
+        for (int scanned = 0; scanned < IOS_MAX_THREADS - 1; scanned++) {
+            pid_t candidate = last_allocated_pid == IOS_MAX_THREADS - 1 ? 1 : last_allocated_pid + 1;
+            last_allocated_pid = candidate;
+            if (pidSlotAvailable(candidate)) return claimPidSlot(candidate, worker);
         }
-        current_pid = last_allocated_pid + 1;
-        last_allocated_pid = current_pid;
-        if (current_pid >= IOS_MAX_THREADS) {
-            current_pid = 1;
-            last_allocated_pid = 1;
-        }
-        if (pidSlotAvailable(current_pid)) {
-            reservedWorkerPid[current_pid] = worker;
-            command_status[current_pid] = 130; // Cancellation before a recorded exit.
-            ios_resetPidWorkerState(current_pid);
-            thread_ids[current_pid] = -1; // Not yet started
-            numVariablesSet[current_pid] = 0;
-            environment[current_pid] = NULL;
-            storeEnvironment(currentEnvironment); // duplicate the environment variables
-            getwd(previousDirectory[current_pid]); // store current working directory
-            previousPid[current_pid] = previousPidId;
-            // fprintf(stderr, "Returning from ios_nextAvailablePid, pid= %d\n", current_pid);
-            return current_pid;
-        }
-        // Dangerous: if the process is already killed, this wil crash
-        /*
-        if (pthread_kill(thread_pid, 0) != 0) {
-            thread_ids[current_pid] = 0;
-            return current_pid; // not running anymore
-        }
-        */
+        pthread_mutex_unlock(&pid_mtx);
+        if (worker) { errno = EAGAIN; return -1; }
+        // Only ordinary slots are freed by thread exit. Waiting on a full table with
+        // reserved workers can deadlock the caller that must reap them.
+        // Keep pid_mtx released so ending commands can free their slots.
+        int cancellation;
+        bool retry;
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
+        pthread_mutex_lock(&thread_completion_mutex);
+        while (!(retry = pidSlotIsFree()) && !hasReservedWorkerPid())
+            pthread_cond_wait(&thread_completed, &thread_completion_mutex);
+        pthread_mutex_unlock(&thread_completion_mutex);
+        pthread_setcancelstate(cancellation, NULL);
+        if (!retry) { errno = EAGAIN; return -1; }
+        pthread_mutex_lock(&pid_mtx);
     }
+}
+
+// Strict proxies do not participate in ordinary command registration or cwd restoration.
+void ios_storeWorkerThread(pid_t pid, pthread_t thread) {
+    atomic_store(&thread_ids[pid], thread);
+    if (!thread) notify_thread_completion();
 }
 
 void ios_storeThreadIdForPid(pid_t pid, pthread_t thread) {
@@ -727,7 +712,7 @@ pid_t ios_currentPid(void) {
 pid_t fork(void) { return ios_nextAvailablePid(false); } // increases current_pid by 1.
 pid_t ios_fork(void) { return ios_nextAvailablePid(false); } // increases current_pid by 1.
 pid_t vfork(void) { return ios_nextAvailablePid(false); }
-pid_t ios_forkWorker(void) { return ios_nextAvailablePid(true); }
+pid_t ios_reserveWorkerPid(void) { return ios_nextAvailablePid(true); }
 
 static void unlockThreadCompletion(void *unused) {
     (void)unused;
