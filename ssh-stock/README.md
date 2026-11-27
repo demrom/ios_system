@@ -18,6 +18,8 @@ The build checks each binary's imports against the selected SDK stubs and the su
 
 When opening `/dev/tty` fails with `ENXIO` or the worker sandbox denies it with `EPERM`, Stock `ssh` can show the host-key confirmation on the a-Shell terminal and read the reply there. Use these client frameworks with the matching ios_system runtime, which preserves the distinction between terminal input and a pipe when starting the SSH worker. Existing host keys are still checked by OpenSSH, and the legacy `$SSH_HOME/known_hosts` file is not imported.
 
+Stock `ssh-keygen` reads passphrases from the echo-free foreground terminal. Press Return at both prompts to choose an empty passphrase; EOF or rejected input aborts instead of saving an unencrypted key. Use the existing `-N` and `-P` options for noninteractive input. The Simulator regression is `tests/stock-ssh-confirm.py SIMULATOR VERIFIED_FRAMEWORKS OUTPUT/sdk --keygen-only`.
+
 Strict POSIX spawn remains extension-only.
 
 The recipe retains the supplied OpenSSL version. The tested input was OpenSSL 1.1.1w; updating that dependency is separate work.
