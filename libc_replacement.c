@@ -6,6 +6,7 @@
 //  Copyright © 2018 Nicolas Holzschuch. All rights reserved.
 //
 #include <stdlib.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <wchar.h>
@@ -188,6 +189,8 @@ int ios_putw(int w, FILE *stream) {
 #define IOS_MAX_THREADS 128
 static _Atomic(pthread_t) thread_ids[IOS_MAX_THREADS];
 static _Atomic int command_status[IOS_MAX_THREADS];
+// A completed strict worker still owns its slot until ios_wait4 reaps it.
+static _Atomic bool reservedWorkerPid[IOS_MAX_THREADS];
 static pthread_mutex_t thread_completion_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t thread_completed = PTHREAD_COND_INITIALIZER;
 
@@ -282,26 +285,36 @@ void newPreviousDirectory(void) {
     getwd(previousDirectory[current_pid]);
 }
 
+static bool pidSlotAvailable(pid_t pid) {
+    return atomic_load(&thread_ids[pid]) == 0 && !atomic_load(&reservedWorkerPid[pid]);
+}
+
 // Called with thread_completion_mutex held: is there a pid that no command uses?
 static int pidSlotIsFree(void) {
     for (int p = 1; p < IOS_MAX_THREADS; p++)
-        if (atomic_load(&thread_ids[p]) == 0) return 1;
+        if (pidSlotAvailable(p)) return 1;
     return 0;
+}
+
+void ios_dropWorkerPid(pid_t pid) {
+    atomic_store(&reservedWorkerPid[pid], false);
+    notify_thread_completion();
 }
 
 // We do not recycle process ids too quickly to avoid collisions.
 void storeEnvironment(char* envp[]);
 extern void ios_resetPidWorkerState(pid_t pid);
-static inline const pid_t ios_nextAvailablePid(void) {
+static inline const pid_t ios_nextAvailablePid(bool worker) {
     ios_cleanupWait(); // Don't start a command while another is ending.
     // fprintf(stderr, "Locking in ios_nextAvailablePid\n");
     pthread_mutex_lock(&pid_mtx);
     char** currentEnvironment = environmentVariables(current_pid);
     int previousPidId = current_pid;
     if (!pid_overflow && (last_allocated_pid < IOS_MAX_THREADS - 1)
-        && (thread_ids[last_allocated_pid+1] == 0)) {
+        && pidSlotAvailable(last_allocated_pid + 1)) {
         current_pid = last_allocated_pid + 1;
         last_allocated_pid = current_pid;
+        reservedWorkerPid[current_pid] = worker;
         command_status[current_pid] = 130; // Cancellation before a recorded exit.
         ios_resetPidWorkerState(current_pid);
         thread_ids[current_pid] = -1; // Not yet started
@@ -319,10 +332,12 @@ static inline const pid_t ios_nextAvailablePid(void) {
     int scanned = 0;
     while (1) {
         if (++scanned > IOS_MAX_THREADS) {
-            // Every slot is taken: wait for a command to end instead of spinning. pid_mtx is released while
-            // waiting, because an ending command waits for it before it frees its slot.
             current_pid = previousPidId;
             pthread_mutex_unlock(&pid_mtx);
+            // A strict spawn caller may itself own the unreaped workers. It cannot wait here for them.
+            if (worker) return -1;
+            // Every slot is taken: wait for a command to end instead of spinning. pid_mtx is released while
+            // waiting, because an ending command waits for it before it frees its slot.
             // pthread_cond_wait is a cancellation point and a cancelled thread would leave it holding
             // thread_completion_mutex, which every ending command takes. Cancel arrives after the wait.
             int cancellation;
@@ -341,8 +356,8 @@ static inline const pid_t ios_nextAvailablePid(void) {
             current_pid = 1;
             last_allocated_pid = 1;
         }
-        pthread_t thread_pid = ios_getThreadId(current_pid);
-        if (thread_pid == 0) { // We found a not-active pid
+        if (pidSlotAvailable(current_pid)) {
+            reservedWorkerPid[current_pid] = worker;
             command_status[current_pid] = 130; // Cancellation before a recorded exit.
             ios_resetPidWorkerState(current_pid);
             thread_ids[current_pid] = -1; // Not yet started
@@ -701,11 +716,26 @@ pid_t ios_currentPid(void) {
 
 // Note to self: do not redefine getpid() unless you have a way to make it consistent even when a "process" starts a new thread.
 // 0MQ and asyncio rely on this.
-pid_t fork(void) { return ios_nextAvailablePid(); } // increases current_pid by 1.
-pid_t ios_fork(void) { return ios_nextAvailablePid(); } // increases current_pid by 1.
-pid_t vfork(void) { return ios_nextAvailablePid(); }
+pid_t fork(void) { return ios_nextAvailablePid(false); } // increases current_pid by 1.
+pid_t ios_fork(void) { return ios_nextAvailablePid(false); } // increases current_pid by 1.
+pid_t vfork(void) { return ios_nextAvailablePid(false); }
+pid_t ios_forkWorker(void) { return ios_nextAvailablePid(true); }
 
+static void unlockThreadCompletion(void *unused) {
+    (void)unused;
+    pthread_mutex_unlock(&thread_completion_mutex);
+}
 
+void ios_waitForThreadCompletion(pid_t pid) {
+    // ios_system detaches command threads, so pthread_join cannot wait for them.
+    // Include the allocated-but-not-started (-1) state and recheck under the
+    // notification mutex to avoid losing an exit between the check and wait.
+    pthread_mutex_lock(&thread_completion_mutex);
+    pthread_cleanup_push(unlockThreadCompletion, NULL);
+    while (atomic_load(&thread_ids[pid]) != 0)
+        pthread_cond_wait(&thread_completed, &thread_completion_mutex);
+    pthread_cleanup_pop(1);
+}
 
 // simple replacement of waitpid for swift programs
 // We use "optnone" to prevent optimization, otherwise the while loops never end.
@@ -724,13 +754,7 @@ __attribute__ ((optnone)) void ios_waitpid(pid_t pid) {
     }
     // New system: thread Id is store with pid:
     if (pid < 0 || pid >= IOS_MAX_THREADS) return;
-    // ios_system detaches command threads, so pthread_join cannot wait for them.
-    // Include the allocated-but-not-started (-1) state and recheck under the
-    // notification mutex to avoid losing an exit between the check and wait.
-    pthread_mutex_lock(&thread_completion_mutex);
-    while (atomic_load(&thread_ids[pid]) != 0)
-        pthread_cond_wait(&thread_completed, &thread_completion_mutex);
-    pthread_mutex_unlock(&thread_completion_mutex);
+    ios_waitForThreadCompletion(pid);
     // fprintf(stderr, "Returning from ios_waitpid for %d \n", pid);
     return;
 }

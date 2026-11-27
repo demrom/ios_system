@@ -432,6 +432,10 @@ static pthread_mutex_t pidUsageMutex = PTHREAD_MUTEX_INITIALIZER;
 static struct rusage pidUsage[IOS_PID_STATUS_SLOTS];
 static bool pidUsageAvailable[IOS_PID_STATUS_SLOTS];
 static bool pidWasSpawned[IOS_PID_STATUS_SLOTS];
+static bool pidWorkerReaping[IOS_PID_STATUS_SLOTS];
+extern pid_t ios_forkWorker(void);
+extern void ios_dropWorkerPid(pid_t pid);
+extern void ios_waitForThreadCompletion(pid_t pid);
 
 // pid of the command running on this thread, so exit() can record its status too.
 static __thread pid_t commandPid = -1;
@@ -451,24 +455,43 @@ static void recordPidStatus(int status) {
     ios_storePidStatus(commandPid, status);
 }
 
+static void abandonWorkerReap(void *argument) {
+    pid_t pid = *(pid_t *)argument;
+    pthread_mutex_lock(&pidUsageMutex);
+    pidWorkerReaping[pid] = false;
+    pthread_mutex_unlock(&pidUsageMutex);
+}
+
 pid_t ios_wait4(pid_t pid, int *status, int options, struct rusage *usage, int *available) {
     if (available) *available = 0;
     if (usage) memset(usage, 0, sizeof(*usage));
     if ((options != 0 && options != WNOHANG) || (usage && !available)) { errno = EINVAL; return -1; }
-    if (pid < 0 || pid >= IOS_PID_STATUS_SLOTS) { errno = ECHILD; return -1; }
+    if (pid <= 0 || pid >= IOS_PID_STATUS_SLOTS) { errno = ECHILD; return -1; }
     pthread_mutex_lock(&pidUsageMutex);
-    bool spawned = pidWasSpawned[pid];
+    if (!pidWasSpawned[pid] || pidWorkerReaping[pid]) {
+        pthread_mutex_unlock(&pidUsageMutex);
+        errno = ECHILD;
+        return -1;
+    }
+    if (options == WNOHANG && ios_getThreadId(pid) != 0) {
+        pthread_mutex_unlock(&pidUsageMutex);
+        return 0;
+    }
+    pidWorkerReaping[pid] = true;
     pthread_mutex_unlock(&pidUsageMutex);
-    if (!spawned) { errno = ECHILD; return -1; }
-    if (options == WNOHANG && ios_getThreadId(pid) != 0) return 0;
-    ios_waitpid(pid);
-    int result = ios_pidStatus(pid);
-    if (result < 0) { errno = ECHILD; return -1; }
-    if (status) *status = W_EXITCODE(result, 0);
+
+    pthread_cleanup_push(abandonWorkerReap, &pid);
+    if (options == 0) ios_waitForThreadCompletion(pid);
+    if (status) *status = W_EXITCODE(ios_pidStatus(pid), 0);
     pthread_mutex_lock(&pidUsageMutex);
     if (usage && pidUsageAvailable[pid]) *usage = pidUsage[pid];
     if (available) *available = pidUsageAvailable[pid];
+    pidWasSpawned[pid] = false;
+    pidWorkerReaping[pid] = false;
     pthread_mutex_unlock(&pidUsageMutex);
+    pthread_cleanup_pop(0);
+    // Allow the allocator to overwrite status only after the reap has copied it.
+    ios_dropWorkerPid(pid);
     return pid;
 }
 
@@ -1387,20 +1410,22 @@ int ios_posix_spawn(pid_t *pid, const char *path,
         return error;
     }
     child->worker.errFd = options.stderr_fd;
-    child->command.pid = ios_fork();
-    pthread_mutex_lock(&pidUsageMutex);
-    pidWasSpawned[child->command.pid] = true;
-    pidUsageAvailable[child->command.pid] = false;
-    pthread_mutex_unlock(&pidUsageMutex);
-    child->command.isPipeIn = true;
-    pid_t childPid = child->command.pid;
-    dispatch_semaphore_t ready = dispatch_semaphore_create(0);
-    child->worker.ready = (__bridge_retained void *)ready;
+    pid_t childPid = ios_forkWorker();
     pthread_t thread;
-    error = pthread_create(&thread, NULL, spawnedWorkerMain, child);
+    dispatch_semaphore_t ready = NULL;
+    if (childPid > 0) {
+        child->command.pid = childPid;
+        child->command.isPipeIn = true;
+        ready = dispatch_semaphore_create(0);
+        child->worker.ready = (__bridge_retained void *)ready;
+        error = pthread_create(&thread, NULL, spawnedWorkerMain, child);
+        if (error) {
+            CFBridgingRelease(child->worker.ready);
+            ios_dropWorkerPid(childPid);
+            ios_storeThreadIdForPid(childPid, NULL);
+        }
+    } else error = EAGAIN;
     if (error) {
-        CFBridgingRelease(child->worker.ready);
-        ios_storeThreadIdForPid(childPid, NULL);
         cancel(child->worker.job);
         release(child->worker.job);
         close(child->worker.fd);
@@ -1411,6 +1436,9 @@ int ios_posix_spawn(pid_t *pid, const char *path,
         return error;
     }
     dispatch_semaphore_wait(ready, DISPATCH_TIME_FOREVER);
+    pthread_mutex_lock(&pidUsageMutex);
+    pidWasSpawned[childPid] = true;
+    pthread_mutex_unlock(&pidUsageMutex);
     *pid = childPid;
     pthread_detach(thread);
     pthread_setcancelstate(cancellationState, NULL);

@@ -249,7 +249,7 @@ Build/register it as a command framework with `-Dmain=spawn_context_main`, Found
 
 # Spawned PID ownership
 
-`spawn-pid-reuse.m` waits for a real worker, recycles its PID through the public allocator, registers an ordinary thread and sends SIGINT through `ios_killpid`. Expected: the signal handler runs; the ordinary thread is not cancelled. This fails when worker ownership is not reset on PID allocation. The ordinary thread explicitly unblocks SIGINT because the host may pass a blocked mask.
+`spawn-pid-reuse.m` lets a real Dash worker exit 7, then rotates the public PID allocator before calling `ios_wait4`. The worker PID must not be allocated again until the waiter reads its exit status; a second wait must fail with `ECHILD`. The pre-fix runtime reports `unreaped worker PID: FAIL` with `reused=1` and `waited=-1`. After reaping, the test recycles the PID, registers an ordinary thread and sends SIGINT through `ios_killpid`. The signal handler must run without cancelling the ordinary thread. The thread explicitly unblocks SIGINT because the host may pass a blocked mask.
 
 `spawn-registration.m` uses an external `pthread_create` scheduling interposer (`spawn-thread-start-hook.c`) to complete an older public PID immediately before a strict child thread starts. Expected: the returned child is registered, bounded WNOHANG polling returns that child and status 0. It also checks that the older PID completed, so an inactive interposer cannot produce a pass. A second run with argument `fail` makes that OS call return EAGAIN and verifies the reserved child slot is released. These guard registration and error cleanup against changes to the global current PID. The hook changes the OS scheduling boundary; ios_system is not instrumented.
 

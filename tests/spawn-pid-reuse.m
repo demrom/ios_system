@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import "ios_system.h"
 #include <dispatch/dispatch.h>
+#include <errno.h>
 #include <signal.h>
 #include <pthread.h>
 #include <sys/wait.h>
@@ -26,12 +27,37 @@ int main(int argc, char **argv) {
     alarm(30);
     char *home;
     if (asprintf(&home, "HOME=%s", argv[1]) < 0) return 1;
-    char *environment[] = { home, NULL }, *command[] = { "sleep", "0", NULL };
+    char *environment[] = { home, NULL }, *command[] = { "dash", "-c", "exit 7", NULL };
     pid_t child = -1;
-    int status;
+    int status = -1;
     int error = ios_posix_spawn(&child, command[0], NULL, NULL, command, environment);
     free(home);
-    if (error || ios_wait4(child, &status, 0, NULL, NULL) != child || status) return 1;
+    if (error) {
+        fprintf(thread_stderr, "ios_posix_spawn failed: %d\n", error);
+        return 1;
+    }
+    // Let the worker and its proxy finish without consuming its exit status.
+    for (int n = 0; n < 500 && ios_getThreadId(child) != 0; n++) usleep(10000);
+    if (ios_getThreadId(child) != 0) return 1;
+
+    BOOL reusedBeforeWait = NO;
+    for (int n = 0; n < 256; n++) {
+        pid_t candidate = ios_fork();
+        ios_storeThreadId(NULL);
+        if (candidate == child) {
+            reusedBeforeWait = YES;
+            break;
+        }
+    }
+    pid_t waited = ios_wait4(child, &status, WNOHANG, NULL, NULL);
+    BOOL retained = !reusedBeforeWait && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 7;
+    fprintf(thread_stdout, "unreaped worker PID: %s (reused=%d child=%d waited=%d status=%d)\n",
+            retained ? "PASS" : "FAIL", reusedBeforeWait, child, waited, status);
+    if (!retained) return 1;
+    if (ios_wait4(child, &status, WNOHANG, NULL, NULL) != -1 || errno != ECHILD) {
+        fprintf(thread_stderr, "second wait did not fail with ECHILD\n");
+        return 1;
+    }
     BOOL passed = NO;
     for (int n = 0; n < 256; n++) {
         pid_t candidate = ios_fork();
